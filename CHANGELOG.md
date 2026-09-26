@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] - 2026-06-08
+
+### Security
+- **Upgraded the Go toolchain to 1.26.6+ to clear 8 standard-library
+  vulnerabilities.** A `govulncheck` scan on the previous toolchain (go1.26.3)
+  flagged 8 issues reachable from this project's call paths — all in the Go
+  standard library, none in project code or third-party dependencies:
+  GO-2026-6218 (`net/url` quadratic `resolvePath`), GO-2026-6090 (`crypto/tls`
+  post-handshake message flood), GO-2026-6089 (`net/http` H2C
+  `ReadHeaderTimeout`), GO-2026-5972 (`encoding/asn1` recursion depth),
+  GO-2026-5856 (`crypto/tls` ECH privacy leak), GO-2026-5039 (`net/textproto`
+  unescaped error input), GO-2026-5037 (`crypto/x509` hostname parsing), and
+  GO-2026-5026 (`net/http` IDNA Punycode). Rebuilding on the current toolchain
+  resolves all of them; `govulncheck ./...` now reports zero affecting the
+  project. No code or dependency changes were required.
+
+### Changed
+- **CI Go version bumped `1.25` → `1.26`** (`check-latest: true` keeps it on the
+  newest 1.26 patch) so release builds match the toolchain the module now
+  requires.
+
 ## [1.2.0] - 2026-06-08
 
 ### Added

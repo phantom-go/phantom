@@ -27,12 +27,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/phantom-item/phantom/internal/auth"
-	"github.com/phantom-item/phantom/internal/config"
-	"github.com/phantom-item/phantom/internal/logger"
-	"github.com/phantom-item/phantom/internal/metrics"
-	"github.com/phantom-item/phantom/internal/protocol"
-	"github.com/phantom-item/phantom/internal/transport"
+	"github.com/phantom-go/phantom/internal/auth"
+	"github.com/phantom-go/phantom/internal/config"
+	"github.com/phantom-go/phantom/internal/logger"
+	"github.com/phantom-go/phantom/internal/metrics"
+	"github.com/phantom-go/phantom/internal/protocol"
+	"github.com/phantom-go/phantom/internal/transport"
 )
 
 var log *slog.Logger

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/phantom-item/phantom/internal/transport"
+	"github.com/phantom-go/phantom/internal/transport"
 )
 
 func BenchmarkTCPRelay(b *testing.B) {

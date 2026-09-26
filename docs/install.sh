@@ -4,7 +4,7 @@ set -e
 
 # ============================================================
 # Phantom Installer
-# https://github.com/phantom-item/phantom
+# https://github.com/phantom-go/phantom
 # ============================================================
 
 RED='\033[0;31m'
@@ -41,7 +41,7 @@ fetch_version() {
         return
     fi
     info "Fetching latest Phantom version..."
-    PHANTOM_VERSION=$(curl -sI --max-time 10 https://github.com/phantom-item/phantom/releases/latest | grep -i location | grep -oP 'tag/\K[^"[:space:]]+' | head -1 | tr -d '\r')
+    PHANTOM_VERSION=$(curl -sI --max-time 10 https://github.com/phantom-go/phantom/releases/latest | grep -i location | grep -oP 'tag/\K[^"[:space:]]+' | head -1 | tr -d '\r')
     if [ -z "$PHANTOM_VERSION" ]; then
         warn "Could not fetch latest version (network issue or GitHub unreachable)."
         warn "Install action will be unavailable; management actions still work on the local config."
@@ -158,7 +158,7 @@ download_phantom() {
         *)       error "Unsupported architecture: $ARCH" ;;
     esac
 
-    URL="https://github.com/phantom-item/phantom/releases/download/${PHANTOM_VERSION}/phantom-${PHANTOM_VERSION}-linux-${ARCH}.tar.gz"
+    URL="https://github.com/phantom-go/phantom/releases/download/${PHANTOM_VERSION}/phantom-${PHANTOM_VERSION}-linux-${ARCH}.tar.gz"
 
     # -f makes curl return non-zero on HTTP errors (404/5xx); without it a
     # "Not Found" HTML page would be saved as phantom.tar.gz and the tar
@@ -737,7 +737,7 @@ show_menu() {
     while true; do
         echo ""
         echo -e "${BLUE}  Phantom ${PHANTOM_VERSION}${NC}"
-        echo -e "${BLUE}  https://github.com/phantom-item/phantom${NC}"
+        echo -e "${BLUE}  https://github.com/phantom-go/phantom${NC}"
         echo ""
         echo "  [1] Install Phantom"
         echo "  [2] Uninstall Phantom"
