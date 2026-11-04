@@ -31,7 +31,7 @@ SERVICE_FILE_LEGACY="/etc/systemd/system/phantom-server.service"
 # 0. Fetch latest version
 #
 # Used by [1] Install to know which release binary to download.
-# Management actions ([3]/[4]/[5]) don't need this — they only edit
+# Management actions ([4]/[5]/[6]) don't need this — they only edit
 # the local config — so a network failure here should not block the
 # menu from showing.
 # ============================================================
@@ -167,7 +167,7 @@ download_phantom() {
     # symlink there and have root install it as the server binary.
     local work
     work=$(mktemp -d) || error "mktemp failed"
-    trap 'rm -rf "$work"' RETURN
+    trap 'rm -rf "$work"; trap - RETURN' RETURN
 
     if ! curl -fsSL --proto '=https' --tlsv1.2 "$URL" -o "$work/$archive"; then
         error "Failed to download binary from GitHub ($URL). Check the version tag and network connection."
@@ -269,12 +269,7 @@ EOF
         # phantom-server reloads its certificate on SIGHUP. Without this hook
         # a renewed certificate was never picked up and clients broke when
         # the old one expired (~90 days after install).
-        mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-        cat > /etc/letsencrypt/renewal-hooks/deploy/phantom-reload.sh <<'HOOK'
-#!/bin/sh
-systemctl reload phantom-server-tcp phantom-server-quic 2>/dev/null || true
-HOOK
-        chmod 755 /etc/letsencrypt/renewal-hooks/deploy/phantom-reload.sh
+        install_cert_hook
     fi
     info "Nginx fallback environment configured."
 }
@@ -355,6 +350,42 @@ configure_firewall() {
 
     ufw --force enable > /dev/null
     info "Firewall enabled."
+}
+
+# ============================================================
+# 9b. Kernel network tuning
+#
+# quic-go wants 7 MiB UDP socket buffers. It used to get them through
+# SO_RCVBUFFORCE, which needs CAP_NET_ADMIN — a capability the sandboxed
+# systemd unit deliberately no longer has. Without raising the kernel
+# ceiling, QUIC falls back to the ~208 KiB default and drops packets under
+# load. Raising rmem_max/wmem_max lets it get the buffers without any extra
+# privilege. BBR + fq markedly improve TCP throughput on long, lossy paths.
+# ============================================================
+configure_sysctl() {
+    local conf=/etc/sysctl.d/99-phantom.conf
+    {
+        echo "# Managed by the Phantom installer."
+        echo "net.core.rmem_max = 7500000"
+        echo "net.core.wmem_max = 7500000"
+        if modprobe tcp_bbr 2>/dev/null || grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+            echo "net.core.default_qdisc = fq"
+            echo "net.ipv4.tcp_congestion_control = bbr"
+        fi
+    } > "$conf"
+    sysctl -q -p "$conf" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || true
+    info "Network tuning applied ($conf)."
+}
+
+# Reload phantom-server after every certbot renewal (SIGHUP reloads the cert).
+install_cert_hook() {
+    [ -d /etc/letsencrypt ] || return 0
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+    cat > /etc/letsencrypt/renewal-hooks/deploy/phantom-reload.sh <<'HOOK'
+#!/bin/sh
+systemctl reload phantom-server-tcp phantom-server-quic 2>/dev/null || true
+HOOK
+    chmod 755 /etc/letsencrypt/renewal-hooks/deploy/phantom-reload.sh
 }
 
 # ============================================================
@@ -647,7 +678,7 @@ print_trojan_notice() {
     echo -e "${YELLOW}  removed in a future release. Prefer the phantom:// link.${NC}"
 }
 
-# Render a single (password -> URI + QR) block. Used by [3] Show users
+# Render a single (password -> URI + QR) block. Used by [4] Show users
 # after a user is added and during install. Reads HOST / ALLOW_INSECURE
 # from globals — caller must invoke resolve_host_mode first.
 print_uri_block() {
@@ -807,6 +838,7 @@ uninstall() {
     warn "  - $SERVICE_FILE_TCP"
     warn "  - $SERVICE_FILE_QUIC"
     warn "  - /etc/phantom/ (config and self-signed certificates)"
+    warn "  - /etc/sysctl.d/99-phantom.conf (network tuning; takes full effect after reboot)"
     read -rp "Are you sure? [y/N]: " CONFIRM
     if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
         info "Uninstall cancelled."
@@ -819,11 +851,34 @@ uninstall() {
     rm -f /usr/local/bin/phantom-server
     rm -f "$SERVICE_FILE_TCP" "$SERVICE_FILE_QUIC" "$SERVICE_FILE_LEGACY"
     rm -rf /etc/phantom/
+    rm -f /etc/sysctl.d/99-phantom.conf /etc/letsencrypt/renewal-hooks/deploy/phantom-reload.sh
     systemctl daemon-reload
     info "Phantom has been uninstalled."
     info "Note: Nginx config was modified during install. To fully revert, run:"
     info "  apt-get install --reinstall nginx-common  # on Debian/Ubuntu"
     info "  yum reinstall nginx                       # on RedHat/CentOS"
+}
+
+# ============================================================
+# Upgrade: new binary + service units, keep config / users / certificates
+# ============================================================
+upgrade() {
+    require_installed || return 1
+    if [ "$PHANTOM_VERSION" = "unknown" ] || [ -z "$PHANTOM_VERSION" ]; then
+        error "Cannot upgrade — version was not resolved. Re-run with a working network connection, or set PHANTOM_VERSION."
+    fi
+    check_root
+    local current
+    current=$("$PHANTOM_DIR/phantom-server" --version 2>/dev/null | awk '{print $2}')
+    info "Upgrading phantom-server ${current:-unknown} -> $PHANTOM_VERSION (users, passwords and certificates are kept)"
+    cp -p "$CONFIG_DIR/config.json" "$CONFIG_DIR/config.json.bak"
+    download_phantom
+    configure_sysctl
+    if grep -q '/etc/letsencrypt/' "$CONFIG_DIR/config.json"; then
+        install_cert_hook
+    fi
+    install_service
+    info "Upgrade complete. Existing links and QR codes keep working."
 }
 
 # ============================================================
@@ -836,13 +891,14 @@ show_menu() {
         echo -e "${BLUE}  https://github.com/phantom-go/phantom${NC}"
         echo ""
         echo "  [1] Install Phantom"
-        echo "  [2] Uninstall Phantom"
-        echo "  [3] Show users (URI + QR code)"
-        echo "  [4] Add user"
-        echo "  [5] Remove user"
-        echo "  [6] Exit"
+        echo "  [2] Upgrade Phantom (keeps users & certificates)"
+        echo "  [3] Uninstall Phantom"
+        echo "  [4] Show users (URI + QR code)"
+        echo "  [5] Add user"
+        echo "  [6] Remove user"
+        echo "  [7] Exit"
         echo ""
-        read -rp "Select an option [1-6]: " OPTION
+        read -rp "Select an option [1-7]: " OPTION
         # Management actions handle their own errors with warn()/return — we
         # don't want a transient failure (e.g. pgrep missing on a minimal
         # system) to drop the user back to the shell. set -e is restored
@@ -850,12 +906,13 @@ show_menu() {
         # fast-fail semantics.
         case $OPTION in
             1) main; return ;;
-            2) uninstall; return ;;
-            3) set +e; show_users;   set -e ;;
-            4) set +e; add_user;     set -e ;;
-            5) set +e; remove_user;  set -e ;;
-            6) exit 0 ;;
-            *) warn "Invalid option. Please select 1-6." ;;
+            2) upgrade; return ;;
+            3) uninstall; return ;;
+            4) set +e; show_users;   set -e ;;
+            5) set +e; add_user;     set -e ;;
+            6) set +e; remove_user;  set -e ;;
+            7) exit 0 ;;
+            *) warn "Invalid option. Please select 1-7." ;;
         esac
     done
 }
@@ -868,6 +925,16 @@ main() {
         error "Cannot install — version was not resolved. Re-run with a working network connection, or set the PHANTOM_VERSION environment variable."
     fi
     check_root
+    if [ -f "$CONFIG_DIR/config.json" ]; then
+        warn "Phantom is already installed. A fresh install generates a NEW password"
+        warn "and certificate: every existing link and QR code will stop working."
+        warn "To update the software and keep your users, choose [2] Upgrade instead."
+        read -rp "Reinstall from scratch anyway? [y/N]: " CONFIRM
+        if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
+            info "Install cancelled."
+            return
+        fi
+    fi
     detect_os
     detect_ssh_port
     ask_domain
@@ -876,6 +943,7 @@ main() {
     configure_nginx
     generate_config
     configure_firewall
+    configure_sysctl
     install_service
     print_info
 }

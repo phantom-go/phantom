@@ -225,3 +225,50 @@ func TestE2ESilentConnectionIsClosed(t *testing.T) {
 		t.Fatalf("server never closed the silent connection (waited %v)", time.Since(start))
 	}
 }
+
+// A real Trojan client doing UDP (e.g. DNS): bare header with CMD=0x03 on the
+// TLS stream, then Trojan-standard frames ATYP|ADDR|PORT|LEN|CRLF|PAYLOAD.
+func TestE2ETrojanClientUDP(t *testing.T) {
+	h := newHarness(t)
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, from, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			pc.WriteTo(append([]byte("echo:"), buf[:n]...), from)
+		}
+	}()
+	port := uint16(pc.LocalAddr().(*net.UDPAddr).Port)
+
+	c, err := tls.Dial("tcp", h.addr, h.tlsCli)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+
+	hdr := []byte(protocol.HashPassword(testPassword) + "\r\n")
+	hdr = append(hdr, protocol.CmdUDP, protocol.AtypIPv4, 0, 0, 0, 0, 0, 0, '\r', '\n')
+	payload := []byte("dns?")
+	frame := []byte{protocol.AtypIPv4, 127, 0, 0, 1, byte(port >> 8), byte(port), 0, byte(len(payload)), '\r', '\n'}
+	frame = append(frame, payload...)
+	c.Write(append(hdr, frame...))
+
+	// Expect: ATYP(1)+IPv4(4)+PORT(2)+LEN(2)+CRLF(2)+"echo:dns?"
+	want := "echo:dns?"
+	resp := make([]byte, 11+len(want))
+	if _, err := io.ReadFull(c, resp); err != nil {
+		t.Fatalf("no UDP reply through Trojan framing: %v", err)
+	}
+	if resp[9] != '\r' || resp[10] != '\n' || string(resp[11:]) != want {
+		t.Fatalf("bad reply frame %q", resp)
+	}
+}

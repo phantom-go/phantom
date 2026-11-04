@@ -183,8 +183,9 @@ func TestUDPPacketRejectsOversize(t *testing.T) {
 	buf.Write([]byte{1, 2, 3, 4})
 	binary.Write(buf, binary.BigEndian, uint16(53))
 	binary.Write(buf, binary.BigEndian, uint16(MaxUDPPayloadLength+1))
-	// CRLF + payload bytes deliberately not written — the length check
-	// must trigger before any read of them.
+	buf.WriteString("\r\n")
+	// Payload deliberately not written — the length check must trigger
+	// before any attempt to read (or allocate) it.
 
 	if _, err := ReadUDPPacket(buf); err == nil {
 		t.Error("ReadUDPPacket accepted oversized length")

@@ -1,6 +1,6 @@
 # Phantom
 
-![Version](https://img.shields.io/badge/version-v1.3.0-blue) ![License](https://img.shields.io/badge/license-AGPL--3.0-orange) ![Go](https://img.shields.io/badge/go-1.26.10%2B-00ADD8)
+![Version](https://img.shields.io/badge/version-v1.3.1-blue) ![License](https://img.shields.io/badge/license-AGPL--3.0-orange) ![Go](https://img.shields.io/badge/go-1.26.10%2B-00ADD8)
 
 **A next-generation encrypted transport, built from the ground up for speed,
 stealth and security — with its own native `phantom://` protocol.**
@@ -109,12 +109,16 @@ Run it again to manage the server:
 
 ```
 [1] Install Phantom
-[2] Uninstall Phantom
-[3] Show users (URI + QR code)
-[4] Add user
-[5] Remove user
-[6] Exit
+[2] Upgrade Phantom (keeps users & certificates)
+[3] Uninstall Phantom
+[4] Show users (URI + QR code)
+[5] Add user
+[6] Remove user
+[7] Exit
 ```
+
+**Upgrading?** Choose `[2]`: it installs the latest release and keeps every
+user, password and certificate, so existing links keep working.
 
 Each password is a separate user with its own traffic metrics. Adding or
 removing one takes effect instantly, without disconnecting anyone else.

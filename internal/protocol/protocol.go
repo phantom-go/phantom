@@ -147,35 +147,39 @@ func WriteHeader(w io.Writer, h *Header) error {
 // into 64 KB-per-packet allocations.
 const MaxUDPPayloadLength = 9000
 
-// ReadUDPPacket parses the Trojan UDP encapsulation with security boundary checks against OOM attacks.
+// ReadUDPPacket parses one UDP frame:
+//
+//	ATYP | DST.ADDR | DST.PORT | Length (2, big-endian) | CRLF | Payload
+//
+// This is the Trojan-standard layout. Earlier versions put the CRLF AFTER
+// the payload, which no real Trojan client does — so UDP (DNS, QUIC, games)
+// through trojan:// compatibility mode never worked.
 func ReadUDPPacket(r io.Reader) (*UDPPacket, error) {
-	addr, err := readAddress(r)
+	sp := scratchPool.Get().(*scratch)
+	defer scratchPool.Put(sp)
+
+	addr, err := readAddressScratch(r, sp)
 	if err != nil {
 		return nil, err
 	}
 
-	var lenBuf [2]byte
-	_, err = io.ReadFull(r, lenBuf[:])
-	if err != nil {
+	// Length + CRLF in one read.
+	lc := sp[:4]
+	if _, err := io.ReadFull(r, lc); err != nil {
 		return nil, err
 	}
-	length := binary.BigEndian.Uint16(lenBuf[:])
+	if lc[2] != '\r' || lc[3] != '\n' {
+		return nil, errInvalidCRLF
+	}
+	length := binary.BigEndian.Uint16(lc[:2])
 
-	// Reject implausibly large payloads. The length field is uint16
-	// (already <= 65535), so the meaningful guard is the protocol-level
-	// MaxUDPPayloadLength limit defined above.
+	// Reject implausibly large payloads (see MaxUDPPayloadLength).
 	if length > MaxUDPPayloadLength {
 		return nil, fmt.Errorf("udp packet length too large: %d (max %d)", length, MaxUDPPayloadLength)
 	}
 
 	payload := make([]byte, length)
-	_, err = io.ReadFull(r, payload)
-	if err != nil {
-		return nil, err
-	}
-
-	err = readCRLF(r)
-	if err != nil {
+	if _, err := io.ReadFull(r, payload); err != nil {
 		return nil, err
 	}
 
@@ -216,18 +220,12 @@ func WriteUDPPacket(w io.Writer, host string, port uint16, payload []byte) error
 		return err
 	}
 	buf = binary.BigEndian.AppendUint16(buf, uint16(len(payload)))
-	buf = append(buf, payload...)
 	buf = append(buf, crlf[:]...)
+	buf = append(buf, payload...)
 	*bp = buf[:0]
 
 	_, err = w.Write(buf)
 	return err
-}
-
-func readCRLF(r io.Reader) error {
-	sp := scratchPool.Get().(*scratch)
-	defer scratchPool.Put(sp)
-	return readCRLFScratch(r, sp)
 }
 
 func readCRLFScratch(r io.Reader, sp *scratch) error {

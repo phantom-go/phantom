@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.1] - 2026-11-04
+
+### Fixed
+- **UDP through `trojan://` compatibility mode never worked.** UDP frames were
+  encoded as `… Length | Payload | CRLF`; the Trojan standard (and our own
+  protocol spec) is `… Length | CRLF | Payload`. Real Trojan clients
+  (Shadowrocket, v2rayN, NekoBox, Clash, sing-box…) therefore failed on DNS,
+  QUIC and any other UDP traffic. phantom-client and phantom-server now both
+  use the standard layout (update both sides together).
+- **QUIC throughput regression from the v1.3.0 systemd sandbox.** quic-go
+  enlarges its UDP buffers to 7 MiB with `SO_RCVBUFFORCE`, which needs
+  `CAP_NET_ADMIN`; the hardened unit no longer has it, so QUIC fell back to
+  the ~208 KiB kernel default and dropped packets under load. The installer
+  now raises `net.core.rmem_max` / `wmem_max` (no extra privilege needed) and
+  enables BBR + fq congestion control where the kernel supports it.
+
+### Added
+- **Installer `[2] Upgrade`**: installs the latest release, refreshes the
+  systemd units and network tuning, and keeps every user, password and
+  certificate. Previously the only path was `[1] Install`, which generated a
+  new password and certificate and locked every existing user out; `[1]` now
+  warns and asks for confirmation when Phantom is already installed.
+
+### Docs
+- Protocol spec 0.2: documents the transport layers a native client must
+  implement (smux v2 over TLS / WebSocket, one QUIC stream per connection,
+  ALPN `phantom`), corrects the UDP frame description, adds `type=ws` /
+  `path`. The previous spec described only the Trojan-compatible header, so a
+  client built from it would not have been a native Phantom client.
+
 ## [1.3.0] - 2026-11-03
 
 Security and performance overhaul.
