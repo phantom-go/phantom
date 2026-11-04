@@ -1,6 +1,6 @@
 # Phantom
 
-![Version](https://img.shields.io/badge/version-v1.3.0-blue) ![License](https://img.shields.io/badge/license-AGPL--3.0-orange) ![Go](https://img.shields.io/badge/go-1.26.6%2B-00ADD8)
+![Version](https://img.shields.io/badge/version-v1.3.0-blue) ![License](https://img.shields.io/badge/license-AGPL--3.0-orange) ![Go](https://img.shields.io/badge/go-1.26.10%2B-00ADD8)
 
 **A next-generation encrypted transport, built from the ground up for speed,
 stealth and security — with its own native `phantom://` protocol.**

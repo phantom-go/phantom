@@ -20,7 +20,9 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # Always the newest 1.26 patch release, so standard-library
+          # security fixes are picked up without editing this file.
+          go-version: '1.26.x'
           check-latest: true
 
       - name: gofmt
@@ -56,7 +58,9 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # Always the newest 1.26 patch release, so standard-library
+          # security fixes are picked up without editing this file.
+          go-version: '1.26.x'
           check-latest: true
 
       - name: Get Version

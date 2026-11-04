@@ -100,6 +100,14 @@ Security and performance overhaul.
   streams disabled. Dialer TCP keep-alive tuned.
 
 ### Dependencies
+- **Go toolchain 1.26.6 → 1.26.10 and golang.org/x/net 0.59.0 → 0.62.0**
+  (x/crypto 0.58.0, x/sys 0.49.0). Clears 10 vulnerabilities govulncheck
+  found reachable from this project, all in the Go standard library:
+  GO-2026-6809 (crypto/x509: distrust compromised intermediates),
+  GO-2026-6617, -6613, -6612, -6611, -6610, -6605, -6603 (net/http, HTTP/1
+  and HTTP/2 server/transport flaws), GO-2026-6608 (MIME header memory limit
+  bypass) and GO-2026-6607 (crypto/tls ECH). CI now tracks the latest 1.26.x
+  patch release automatically.
 - quic-go 0.59.1 → 0.65.0, smux 1.5.57 → 1.5.58, coder/websocket
   1.8.14 → 1.8.15, klauspost/compress 1.17.4 → 1.20.3, brotli 1.0.6 → 1.2.7.
 
