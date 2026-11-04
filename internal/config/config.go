@@ -1,10 +1,13 @@
 package config
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
+	"runtime"
+	"strings"
 )
 
 // Thin wrappers — kept as package-locals so the validation helpers
@@ -121,6 +124,63 @@ type ClientConfig struct {
 	//     connections.
 	// Ignored when SessionPoolSize == 1 (the pool never grows past one).
 	SessionGrowthThreshold int `json:"session_growth_threshold"`
+
+	// PinnedCertSHA256 pins the server's leaf certificate by the SHA-256
+	// of its DER encoding (hex, colons optional — the format printed by
+	// `openssl x509 -noout -fingerprint -sha256`).
+	//
+	// When set, the connection is accepted only if the presented leaf
+	// matches, even with verify=false. This gives real MITM protection to
+	// direct-IP + self-signed deployments, which previously had none at
+	// all (verify=false skipped every check). With verify=true both the
+	// CA chain and the pin must pass.
+	PinnedCertSHA256 string `json:"pinned_cert_sha256,omitempty"`
+}
+
+// PinnedCertBytes returns the decoded certificate pin, or nil when unset.
+func (c *ClientConfig) PinnedCertBytes() []byte {
+	if c.PinnedCertSHA256 == "" {
+		return nil
+	}
+	b, err := decodePin(c.PinnedCertSHA256)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+func decodePin(s string) ([]byte, error) {
+	clean := strings.ToLower(strings.NewReplacer(":", "", " ", "").Replace(s))
+	b, err := hex.DecodeString(clean)
+	if err != nil {
+		return nil, fmt.Errorf("client.pinned_cert_sha256: not hex: %w", err)
+	}
+	if len(b) != 32 {
+		return nil, fmt.Errorf("client.pinned_cert_sha256: want 32 bytes (SHA-256), got %d", len(b))
+	}
+	return b, nil
+}
+
+func validTransport(t string) bool {
+	switch t {
+	case "tcp", "ws", "quic":
+		return true
+	}
+	return false
+}
+
+// InsecurePermissions reports whether the config file is readable or writable
+// by group/other. The file holds plaintext passwords, so on Unix it should be
+// mode 0600 (or 0640 with a dedicated group).
+func InsecurePermissions(path string) bool {
+	if runtime.GOOS == "windows" {
+		return false
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return fi.Mode().Perm()&0o007 != 0
 }
 
 func LoadFromFile(path string) (*Config, error) {
@@ -148,6 +208,16 @@ func (c *Config) Validate() error {
 		if len(c.Server.Passwords) == 0 {
 			return fmt.Errorf("server.passwords is required")
 		}
+		seen := make(map[string]struct{}, len(c.Server.Passwords))
+		for i, pw := range c.Server.Passwords {
+			if pw == "" {
+				return fmt.Errorf("server.passwords[%d] is empty", i)
+			}
+			if _, dup := seen[pw]; dup {
+				return fmt.Errorf("server.passwords[%d] is a duplicate", i)
+			}
+			seen[pw] = struct{}{}
+		}
 		if c.Server.CertFile == "" {
 			return fmt.Errorf("server.cert_file is required")
 		}
@@ -157,6 +227,12 @@ func (c *Config) Validate() error {
 		// Default transport to tcp if not specified
 		if c.Server.Transport == "" {
 			c.Server.Transport = "tcp"
+		}
+		if !validTransport(c.Server.Transport) {
+			return fmt.Errorf("server.transport %q: must be tcp, ws or quic", c.Server.Transport)
+		}
+		if c.Server.WSPath != "" && !strings.HasPrefix(c.Server.WSPath, "/") {
+			return fmt.Errorf("server.ws_path %q must start with '/'", c.Server.WSPath)
 		}
 		// Set a stealthy default path if transport is websocket
 		if c.Server.Transport == "ws" && c.Server.WSPath == "" {
@@ -178,6 +254,20 @@ func (c *Config) Validate() error {
 		// Default transport to tcp if not specified
 		if c.Client.Transport == "" {
 			c.Client.Transport = "tcp"
+		}
+		if !validTransport(c.Client.Transport) {
+			return fmt.Errorf("client.transport %q: must be tcp, ws or quic", c.Client.Transport)
+		}
+		if c.Client.WSPath != "" && !strings.HasPrefix(c.Client.WSPath, "/") {
+			return fmt.Errorf("client.ws_path %q must start with '/'", c.Client.WSPath)
+		}
+		if _, _, err := net.SplitHostPort(c.Client.ServerAddr); err != nil {
+			return fmt.Errorf("client.server_addr %q is not host:port: %w", c.Client.ServerAddr, err)
+		}
+		if c.Client.PinnedCertSHA256 != "" {
+			if _, err := decodePin(c.Client.PinnedCertSHA256); err != nil {
+				return err
+			}
 		}
 		// Pool size defaults to 1 (single-session, zero extra signature).
 		if c.Client.SessionPoolSize == 0 {

@@ -287,3 +287,34 @@ func TestPoolCloseReleasesSessions(t *testing.T) {
 	}
 	mu.Unlock()
 }
+
+// TestPoolColdStartDialsOnce: a burst of concurrent opens against an empty
+// pool must trigger exactly one handshake, not one per caller.
+func TestPoolColdStartDialsOnce(t *testing.T) {
+	dial, dials, _, _ := dialerFactory(50 * time.Millisecond)
+	p := newSessionPool(1, 16, dial)
+	defer p.Close()
+
+	var wg sync.WaitGroup
+	const n = 64
+	wg.Add(n)
+	var failures atomic.Int64
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			st, err := p.OpenStream()
+			if err != nil {
+				failures.Add(1)
+				return
+			}
+			st.Close()
+		}()
+	}
+	wg.Wait()
+	if got := dials.Load(); got != 1 {
+		t.Errorf("cold start: expected 1 dial, got %d", got)
+	}
+	if f := failures.Load(); f != 0 {
+		t.Errorf("cold start: %d OpenStream failures", f)
+	}
+}

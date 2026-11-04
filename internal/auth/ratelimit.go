@@ -2,6 +2,7 @@ package auth
 
 import (
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 )
@@ -117,30 +118,46 @@ func (rl *RateLimiter) RecordFailure(addr net.Addr) {
 	}
 }
 
-// evictOldestLocked removes the single least-recently-seen record that is NOT
-// currently banned, to make room under the cap. Callers must hold rl.mu.
+// evictOldestLocked makes room under the cap. Callers must hold rl.mu.
 //
-// Banned records are deliberately exempt: evicting them would let an attacker
-// flush an active ban by spamming fresh source IPs. If every record is
-// currently banned (pathological — the whole table is hostile and capped),
-// we leave the map as-is; the cap may be briefly exceeded but the cleanup
-// loop reclaims banned entries once their bans expire.
+// The previous implementation scanned the WHOLE map to delete a single
+// least-recently-seen entry on every insert once the cap was reached. Under
+// exactly the attack the cap exists for (a spray of fresh source IPs), each
+// failure did a 100k-entry scan while holding the global mutex that every
+// new connection's IsBanned() also needs — an O(n) CPU amplification that
+// stalled the accept path.
+//
+// Now one pass reclaims a batch (1/64 of the cap): expired records first,
+// then arbitrary non-banned ones (Go map iteration order is randomised, so
+// this is random eviction). The scan cost is amortised over the batch,
+// giving O(64) work per insert.
+//
+// Banned records are deliberately exempt: evicting them would let an
+// attacker flush an active ban by spamming fresh source IPs.
 func (rl *RateLimiter) evictOldestLocked(now time.Time) {
-	var oldestKey string
-	var oldestSeen time.Time
-	found := false
+	batch := rl.maxEntries / 64
+	if batch < 1 {
+		batch = 1
+	}
+	removed := 0
 	for ip, rec := range rl.failures {
+		if now.Sub(rec.firstSeen) > rl.window && now.After(rec.bannedTill) {
+			delete(rl.failures, ip)
+			removed++
+		}
+	}
+	if removed >= batch {
+		return
+	}
+	for ip, rec := range rl.failures {
+		if removed >= batch {
+			return
+		}
 		if now.Before(rec.bannedTill) {
 			continue // never evict an active ban
 		}
-		if !found || rec.lastSeen.Before(oldestSeen) {
-			oldestKey = ip
-			oldestSeen = rec.lastSeen
-			found = true
-		}
-	}
-	if found {
-		delete(rl.failures, oldestKey)
+		delete(rl.failures, ip)
+		removed++
 	}
 }
 
@@ -176,13 +193,40 @@ func (rl *RateLimiter) cleanupLoop() {
 	}
 }
 
+// extractIP returns the rate-limit key for addr.
+//
+// IPv4 addresses are keyed individually. IPv6 addresses are keyed by their
+// /64 prefix: a single customer/VM is routinely handed a whole /64 (2^64
+// addresses), so per-/128 accounting let one attacker rotate source
+// addresses indefinitely and never accumulate enough failures to be banned.
 func extractIP(addr net.Addr) string {
 	if addr == nil {
 		return ""
 	}
-	host, _, err := net.SplitHostPort(addr.String())
-	if err != nil {
+	var ip netip.Addr
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		ip, _ = netip.AddrFromSlice(a.IP)
+	case *net.UDPAddr:
+		ip, _ = netip.AddrFromSlice(a.IP)
+	default:
+		host, _, err := net.SplitHostPort(addr.String())
+		if err != nil {
+			return ""
+		}
+		ip, _ = netip.ParseAddr(host)
+		if !ip.IsValid() {
+			return host
+		}
+	}
+	if !ip.IsValid() {
 		return ""
 	}
-	return host
+	ip = ip.Unmap()
+	if ip.Is6() {
+		if p, err := ip.Prefix(64); err == nil {
+			return p.String()
+		}
+	}
+	return ip.String()
 }

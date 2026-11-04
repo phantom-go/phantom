@@ -66,6 +66,13 @@ type sessionPool struct {
 	// they all observe "needs growth" at once. Only one new dial is in
 	// flight at a time; others reuse whatever is currently available.
 	dialing bool
+	// dialDone is closed when the in-flight dial finishes. Callers that
+	// find the pool EMPTY while a dial is in flight wait on it instead of
+	// starting their own dial. Previously "empty" bypassed the dialing
+	// guard, so N concurrent requests at startup or after a disconnect
+	// fired N simultaneous TLS handshakes (a loud fingerprint, wasted
+	// RTTs) and appended all N sessions — ignoring maxSize entirely.
+	dialDone chan struct{}
 }
 
 // newSessionPool builds a pool. maxSize < 1 is clamped to 1. growthThreshold
@@ -136,44 +143,45 @@ func (p *sessionPool) minLoadLocked() int {
 // OpenStream acquires a stream from the pool, dialling a new session if needed.
 // The dial happens with the lock released.
 func (p *sessionPool) OpenStream() (io.ReadWriteCloser, error) {
-	for attempt := 0; attempt < 2; attempt++ {
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
 		p.mu.Lock()
 		p.pruneLocked()
 
-		needDial := len(p.sessions) == 0 ||
+		empty := len(p.sessions) == 0
+		if empty && p.dialing {
+			// Someone is already establishing the first session: wait
+			// for it rather than piling on another handshake.
+			ch := p.dialDone
+			p.mu.Unlock()
+			<-ch
+			continue
+		}
+
+		needDial := empty ||
 			(len(p.sessions) < p.maxSize &&
 				p.minLoadLocked() >= p.growthThreshold &&
 				!p.dialing)
 
-		// If we don't need to dial, just use an existing session.
 		if !needDial {
 			s := p.pickLocked()
 			p.mu.Unlock()
 			if s == nil {
-				// Race: pruned to empty between checks. Retry, which
-				// will trigger a dial.
 				continue
 			}
 			stream, err := s.OpenStream()
 			if err != nil {
-				// Session died under us; loop to prune + retry.
+				lastErr = err
 				continue
 			}
 			return stream, nil
 		}
 
-		// We are the goroutine elected to dial. Mark dialing, release the
-		// lock, perform the (possibly slow) handshake unlocked.
-		p.dialing = true
-		p.mu.Unlock()
-
-		sess, err := p.dial()
-
-		p.mu.Lock()
-		p.dialing = false
+		sess, err := p.dialLocked()
 		if err != nil {
-			// Dial failed. If we still have a usable session, fall back to
-			// it; otherwise surface the error.
+			lastErr = err
+			// Dial failed. Fall back to any usable session.
+			p.mu.Lock()
 			p.pruneLocked()
 			s := p.pickLocked()
 			p.mu.Unlock()
@@ -184,17 +192,15 @@ func (p *sessionPool) OpenStream() (io.ReadWriteCloser, error) {
 			}
 			return nil, err
 		}
-		p.sessions = append(p.sessions, sess)
-		p.mu.Unlock()
 
 		stream, oerr := sess.OpenStream()
 		if oerr != nil {
+			lastErr = oerr
 			continue
 		}
 		return stream, nil
 	}
 
-	// Final attempt: best-effort pick.
 	p.mu.Lock()
 	p.pruneLocked()
 	s := p.pickLocked()
@@ -202,7 +208,40 @@ func (p *sessionPool) OpenStream() (io.ReadWriteCloser, error) {
 	if s != nil {
 		return s.OpenStream()
 	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
 	return nil, errPoolUnavailable
+}
+
+// dialLocked is entered with p.mu held and returns with it released. It marks
+// a dial in flight, performs it unlocked, publishes the result, and wakes any
+// waiters.
+func (p *sessionPool) dialLocked() (pooledSession, error) {
+	p.dialing = true
+	done := make(chan struct{})
+	p.dialDone = done
+	p.mu.Unlock()
+
+	sess, err := p.dial()
+
+	p.mu.Lock()
+	p.dialing = false
+	p.dialDone = nil
+	if err == nil {
+		if len(p.sessions) < p.maxSize {
+			p.sessions = append(p.sessions, sess)
+		} else {
+			// Defensive: never exceed maxSize.
+			p.mu.Unlock()
+			close(done)
+			sess.Close()
+			return nil, errPoolUnavailable
+		}
+	}
+	p.mu.Unlock()
+	close(done)
+	return sess, err
 }
 
 // keepAlive runs in the background, periodically pruning dead sessions and
@@ -219,20 +258,9 @@ func (p *sessionPool) keepAlive(interval time.Duration, stop <-chan struct{}) {
 		case <-t.C:
 			p.mu.Lock()
 			p.pruneLocked()
-			empty := len(p.sessions) == 0
-			dialing := p.dialing
-			if empty && !dialing {
-				p.dialing = true
-			}
-			p.mu.Unlock()
-
-			if empty && !dialing {
-				sess, err := p.dial()
-				p.mu.Lock()
-				p.dialing = false
-				if err == nil {
-					p.sessions = append(p.sessions, sess)
-				}
+			if len(p.sessions) == 0 && !p.dialing {
+				_, _ = p.dialLocked()
+			} else {
 				p.mu.Unlock()
 			}
 		}

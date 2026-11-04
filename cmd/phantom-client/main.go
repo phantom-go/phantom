@@ -11,8 +11,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"flag"
 	"io"
 	"net"
@@ -24,6 +29,7 @@ import (
 	"github.com/phantom-go/phantom/internal/config"
 	"github.com/phantom-go/phantom/internal/logger"
 	"github.com/phantom-go/phantom/internal/protocol"
+	"github.com/phantom-go/phantom/internal/relay"
 	"github.com/phantom-go/phantom/internal/socks5"
 	"github.com/phantom-go/phantom/internal/transport"
 	"github.com/quic-go/quic-go"
@@ -33,6 +39,15 @@ import (
 
 var log = logger.New()
 
+const (
+	dialTimeout      = 10 * time.Second
+	handshakeTimeout = 10 * time.Second
+	socksTimeout     = 10 * time.Second
+)
+
+// passwordHash is computed once at startup instead of per connection.
+var passwordHash string
+
 // version is injected at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
@@ -40,7 +55,9 @@ func main() {
 	useQUIC := flag.Bool("quic", false, "use QUIC transport")
 	configPath := flag.String("config", "config.json", "path to configuration file")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	logLevel := flag.String("log-level", os.Getenv("PHANTOM_LOG_LEVEL"), "log level: debug, info, warn, error")
 	flag.Parse()
+	log = logger.NewWithLevel(*logLevel)
 
 	if *showVersion {
 		os.Stdout.WriteString("phantom-client " + version + "\n")
@@ -51,6 +68,13 @@ func main() {
 	if err != nil {
 		log.Error("load config", "err", err)
 		os.Exit(1)
+	}
+	if config.InsecurePermissions(*configPath) {
+		log.Warn("config file is readable by other users and contains the password; run: chmod 600 " + *configPath)
+	}
+	passwordHash = protocol.HashPassword(cfg.Client.Password)
+	if !cfg.Client.VerifyEnabled() && cfg.Client.PinnedCertSHA256 == "" {
+		log.Warn("verify=false without pinned_cert_sha256: the server is NOT authenticated and the tunnel is open to man-in-the-middle attacks")
 	}
 
 	// QUIC is enabled by either the --quic flag or transport="quic" in
@@ -85,21 +109,45 @@ func main() {
 // protocol-spec ?allowInsecure=1 use case for IP + self-signed deployments).
 // When true, the server certificate is verified against the SNI host as
 // usual — operators using a domain + CA cert should leave this enabled.
-func dialUTLS(serverAddr string, fingerprint string, verify bool) (net.Conn, error) {
+func dialUTLS(serverAddr string, fingerprint string, verify bool, pin []byte) (net.Conn, error) {
+	// HelloRandomized occasionally generates a ClientHello that uTLS itself
+	// cannot complete ("CurvePreferences includes unsupported curve"),
+	// which surfaced as random connection failures. A fresh randomisation
+	// almost always succeeds, so retry a few times.
+	attempts := 1
+	if fingerprint == "HelloRandomized" {
+		attempts = 4
+	}
+	var err error
+	for i := 0; i < attempts; i++ {
+		var c net.Conn
+		if c, err = dialUTLSOnce(serverAddr, fingerprint, verify, pin); err == nil {
+			return c, nil
+		}
+		if errors.Is(err, errPinMismatch) {
+			return nil, err
+		}
+	}
+	return nil, err
+}
+
+func dialUTLSOnce(serverAddr string, fingerprint string, verify bool, pin []byte) (net.Conn, error) {
 	host, _, err := net.SplitHostPort(serverAddr)
 	if err != nil {
 		host = serverAddr
 	}
 
-	tcpConn, err := net.Dial("tcp", serverAddr)
+	d := &net.Dialer{Timeout: dialTimeout}
+	tcpConn, err := d.Dial("tcp", serverAddr)
 	if err != nil {
 		return nil, err
 	}
 
 	uConfig := &utls.Config{
-		ServerName:         host,
-		InsecureSkipVerify: !verify,
-		NextProtos:         []string{"phantom"},
+		ServerName:            host,
+		InsecureSkipVerify:    !verify,
+		NextProtos:            []string{"phantom"},
+		VerifyPeerCertificate: pinVerifier(pin),
 	}
 
 	var clientHelloID utls.ClientHelloID
@@ -115,11 +163,60 @@ func dialUTLS(serverAddr string, fingerprint string, verify bool) (net.Conn, err
 	}
 
 	uConn := utls.UClient(tcpConn, uConfig, clientHelloID)
+	// Bound the handshake: an unresponsive server (or a middlebox that
+	// black-holes the ClientHello) previously hung the pool's dial forever.
+	_ = tcpConn.SetDeadline(time.Now().Add(handshakeTimeout))
 	if err := uConn.Handshake(); err != nil {
 		tcpConn.Close()
 		return nil, err
 	}
+	_ = tcpConn.SetDeadline(time.Time{})
 	return uConn, nil
+}
+
+var errPinMismatch = errors.New("server certificate does not match pinned_cert_sha256")
+
+// pinVerifier returns a VerifyPeerCertificate hook that accepts only a leaf
+// whose SHA-256 equals pin. It runs even when InsecureSkipVerify is set, which
+// is exactly what makes pinning useful for self-signed deployments.
+func pinVerifier(pin []byte) func([][]byte, [][]*x509.Certificate) error {
+	if len(pin) == 0 {
+		return nil
+	}
+	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return errPinMismatch
+		}
+		sum := sha256.Sum256(rawCerts[0])
+		if subtle.ConstantTimeCompare(sum[:], pin) != 1 {
+			return errPinMismatch
+		}
+		return nil
+	}
+}
+
+// acceptLoop accepts SOCKS connections. A permanent Accept error (EMFILE)
+// previously made the loop spin at 100% CPU logging an error per iteration.
+func acceptLoop(ln net.Listener, handle func(net.Conn)) {
+	var backoff time.Duration
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if backoff == 0 {
+				backoff = 5 * time.Millisecond
+			} else if backoff *= 2; backoff > time.Second {
+				backoff = time.Second
+			}
+			log.Error("accept", "err", err, "backoff", backoff)
+			time.Sleep(backoff)
+			continue
+		}
+		backoff = 0
+		go handle(conn)
+	}
 }
 
 func runTCP(cfg *config.Config, ln net.Listener) {
@@ -134,23 +231,15 @@ func runTCP(cfg *config.Config, ln net.Listener) {
 	defer close(stop)
 	go pool.keepAlive(15*time.Second, stop)
 
-	for {
-		conn, err := ln.Accept()
+	acceptLoop(ln, func(c net.Conn) {
+		defer c.Close()
+		stream, err := pool.OpenStream()
 		if err != nil {
-			log.Error("accept", "err", err)
-			continue
+			log.Error("open stream", "err", err)
+			return
 		}
-
-		go func(c net.Conn) {
-			defer c.Close()
-			stream, err := pool.OpenStream()
-			if err != nil {
-				log.Error("open stream", "err", err)
-				return
-			}
-			handleClientConn(c, stream, cfg)
-		}(conn)
-	}
+		handleClientConn(c, stream, cfg)
+	})
 }
 
 // smuxSession adapts *smux.Session to the pooledSession interface.
@@ -197,7 +286,7 @@ func (c *countedSmuxStream) Close() error {
 // handshake. It is invoked by the pool with no lock held.
 func dialSmuxSession(cfg *config.Config) (pooledSession, error) {
 	// 1. Establish the underlying uTLS connection (obfuscates JA3/JA4).
-	conn, err := dialUTLS(cfg.Client.ServerAddr, cfg.Client.TLSFingerprint, cfg.Client.VerifyEnabled())
+	conn, err := dialUTLS(cfg.Client.ServerAddr, cfg.Client.TLSFingerprint, cfg.Client.VerifyEnabled(), cfg.Client.PinnedCertBytes())
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +304,7 @@ func dialSmuxSession(cfg *config.Config) (pooledSession, error) {
 	}
 
 	// 3. Bind the smux multiplexer onto the secure tunnel.
-	sess, err := smux.Client(conn, smux.DefaultConfig())
+	sess, err := smux.Client(conn, transport.MuxConfig(transport.ClientMuxVersion))
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -236,23 +325,15 @@ func runQUIC(cfg *config.Config, ln net.Listener) {
 	defer close(stop)
 	go pool.keepAlive(15*time.Second, stop)
 
-	for {
-		conn, err := ln.Accept()
+	acceptLoop(ln, func(c net.Conn) {
+		defer c.Close()
+		stream, err := pool.OpenStream()
 		if err != nil {
-			log.Error("accept", "err", err)
-			continue
+			log.Error("open quic stream", "err", err)
+			return
 		}
-
-		go func(c net.Conn) {
-			defer c.Close()
-			stream, err := pool.OpenStream()
-			if err != nil {
-				log.Error("open quic stream", "err", err)
-				return
-			}
-			handleClientConn(c, stream, cfg)
-		}(conn)
-	}
+		handleClientConn(c, stream, cfg)
+	})
 }
 
 // quicSession adapts a *quic.Conn to the pooledSession interface, tracking the
@@ -287,10 +368,16 @@ type countedStream struct {
 	once   sync.Once
 }
 
+// Close releases both directions. quic.Stream.Close only closes the send
+// side, so the receive buffer used to linger until the server sent FIN.
 func (c *countedStream) Close() error {
 	c.once.Do(func() { c.parent.streams.Add(-1) })
+	c.Stream.CancelRead(0)
 	return c.Stream.Close()
 }
+
+// CloseWrite half-closes (sends FIN) so the relay can propagate EOF.
+func (c *countedStream) CloseWrite() error { return c.Stream.Close() }
 
 func dialQUICSession(cfg *config.Config) (pooledSession, error) {
 	qc, err := newQUICSession(cfg)
@@ -305,9 +392,10 @@ func newQUICSession(cfg *config.Config) (*quic.Conn, error) {
 		// Honour the per-client verify toggle. Same trade-off as dialUTLS:
 		// for IP + self-signed deployments verify must be false; for
 		// domain + CA cert deployments it should stay true.
-		InsecureSkipVerify: !cfg.Client.VerifyEnabled(),
-		NextProtos:         []string{"phantom"},
-		MinVersion:         tls.VersionTLS13,
+		InsecureSkipVerify:    !cfg.Client.VerifyEnabled(),
+		NextProtos:            []string{"phantom"},
+		MinVersion:            tls.VersionTLS13,
+		VerifyPeerCertificate: pinVerifier(cfg.Client.PinnedCertBytes()),
 	}
 	// When verifying, derive ServerName from server_addr so the cert's
 	// SNI / Subject Alt Name is matched against the host the user typed.
@@ -331,11 +419,15 @@ func newQUICSession(cfg *config.Config) (*quic.Conn, error) {
 func handleClientConn(conn net.Conn, stream io.ReadWriteCloser, cfg *config.Config) {
 	defer stream.Close()
 
+	// A local client that connects and never completes the SOCKS
+	// handshake used to pin a goroutine and a tunnel stream forever.
+	conn.SetDeadline(time.Now().Add(socksTimeout))
 	req, err := socks5.Handshake(conn)
 	if err != nil {
-		log.Error("socks5 handshake", "err", err)
+		log.Debug("socks5 handshake", "err", err)
 		return
 	}
+	conn.SetDeadline(time.Time{})
 
 	cmdHost := req.Host
 	cmdPort := req.Port
@@ -353,7 +445,7 @@ func handleClientConn(conn net.Conn, stream io.ReadWriteCloser, cfg *config.Conf
 	}
 
 	header := &protocol.Header{
-		PasswordHash: protocol.HashPassword(cfg.Client.Password),
+		PasswordHash: passwordHash,
 		Request: protocol.Request{
 			Command: cmd,
 			Address: addr,
@@ -361,75 +453,79 @@ func handleClientConn(conn net.Conn, stream io.ReadWriteCloser, cfg *config.Conf
 	}
 
 	if err := protocol.WriteHeader(stream, header); err != nil {
-		log.Error("write header", "err", err)
+		log.Debug("write header", "err", err)
 		return
 	}
 
 	if req.IsUDP {
-		log.Info("udp associate", "client", conn.RemoteAddr())
+		log.Debug("udp associate", "client", conn.RemoteAddr())
 		handleUDP(conn, stream)
 		return
 	}
 
-	log.Info("relay", "host", req.Host, "port", req.Port)
-	relay(conn, stream)
+	log.Debug("relay", "host", req.Host, "port", req.Port)
+	relay.Pipe(conn, stream, relay.DefaultIdleTimeout)
 }
 
-func handleUDP(tcpConn net.Conn, stream io.ReadWriter) {
-	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-	if err != nil {
-		log.Error("resolve local udp addr", "err", err)
-		return
+// handleUDP serves one SOCKS5 UDP ASSOCIATE.
+//
+// Security: the relay socket accepts datagrams only from the IP that opened
+// the TCP control connection, and locks onto the first sender's port
+// (RFC 1928 §7). Previously any local process could inject datagrams into —
+// or hijack replies from — another user's association simply by sending to
+// the 127.0.0.1 port, because the "client address" was overwritten by
+// whoever sent last. The socket is also bound to the control connection's
+// local IP, so UDP works when the SOCKS listener is on a LAN address
+// (previously it always bound 127.0.0.1, unreachable from LAN clients).
+func handleUDP(tcpConn net.Conn, stream io.ReadWriteCloser) {
+	localIP := net.IPv4(127, 0, 0, 1)
+	if la, ok := tcpConn.LocalAddr().(*net.TCPAddr); ok && la.IP != nil && !la.IP.IsUnspecified() {
+		localIP = la.IP
+	}
+	var peerIP net.IP
+	if ra, ok := tcpConn.RemoteAddr().(*net.TCPAddr); ok {
+		peerIP = ra.IP
 	}
 
-	udpConn, err := net.ListenUDP("udp", udpAddr)
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: localIP})
 	if err != nil {
 		log.Error("listen local udp", "err", err)
 		return
 	}
 	defer udpConn.Close()
+	defer stream.Close()
 
-	// Closing the tunnel stream on exit guarantees the inbound
-	// ReadUDPPacket goroutine below unblocks promptly rather than
-	// lingering on a blocked read until the parent's deferred
-	// stream.Close() eventually fires.
-	if sc, ok := stream.(io.Closer); ok {
-		defer sc.Close()
-	}
-
-	localPort := udpConn.LocalAddr().(*net.UDPAddr).Port
-
-	if err := socks5.SendReply(tcpConn, socks5.RepSuccess, "127.0.0.1", uint16(localPort)); err != nil {
+	bound := udpConn.LocalAddr().(*net.UDPAddr)
+	if err := socks5.SendReply(tcpConn, socks5.RepSuccess, bound.IP.String(), uint16(bound.Port)); err != nil {
 		log.Error("send socks5 udp reply", "err", err)
 		return
 	}
 
-	done := make(chan struct{}, 2)
-	var clientUDPAddr *net.UDPAddr
-	var mu sync.Mutex
+	done := make(chan struct{}, 3)
+	var clientUDPAddr atomic.Pointer[net.UDPAddr]
 
 	go func() {
 		defer func() { done <- struct{}{} }()
-		buf := make([]byte, 65535)
+		big := make([]byte, 65535)
 		for {
-			n, addr, err := udpConn.ReadFromUDP(buf)
+			n, addr, err := udpConn.ReadFromUDP(big)
 			if err != nil {
 				return
 			}
-			mu.Lock()
-			clientUDPAddr = addr
-			mu.Unlock()
-
-			socksReq, err := socks5.ParseUDPHeader(buf[:n])
+			if peerIP != nil && !addr.IP.Equal(peerIP) {
+				continue // not the owner of this association
+			}
+			if cur := clientUDPAddr.Load(); cur == nil {
+				clientUDPAddr.Store(addr)
+			} else if cur.Port != addr.Port {
+				continue
+			}
+			socksReq, err := socks5.ParseUDPHeader(big[:n])
 			if err != nil {
 				continue
 			}
-			// The peer's ReadUDPPacket rejects payloads above
-			// MaxUDPPayloadLength and treats that as a fatal stream
-			// error. Drop the single oversized datagram here rather
-			// than framing it and killing the entire UDP session.
 			if len(socksReq.Payload) > protocol.MaxUDPPayloadLength {
-				log.Warn("dropping oversized udp datagram", "size", len(socksReq.Payload), "max", protocol.MaxUDPPayloadLength)
+				log.Debug("dropping oversized udp datagram", "size", len(socksReq.Payload), "max", protocol.MaxUDPPayloadLength)
 				continue
 			}
 			if err := protocol.WriteUDPPacket(stream, socksReq.Host, socksReq.Port, socksReq.Payload); err != nil {
@@ -440,18 +536,18 @@ func handleUDP(tcpConn net.Conn, stream io.ReadWriter) {
 
 	go func() {
 		defer func() { done <- struct{}{} }()
+		br := bufio.NewReaderSize(stream, 16<<10)
+		out := make([]byte, 0, 4+1+255+2+protocol.MaxUDPPayloadLength)
 		for {
-			pkt, err := protocol.ReadUDPPacket(stream)
+			pkt, err := protocol.ReadUDPPacket(br)
 			if err != nil {
 				return
 			}
-			mu.Lock()
-			cAddr := clientUDPAddr
-			mu.Unlock()
+			cAddr := clientUDPAddr.Load()
 			if cAddr == nil {
 				continue
 			}
-			socksPacket, err := socks5.NewUDPResponseHeader(pkt.Address.Host, pkt.Address.Port, pkt.Payload)
+			socksPacket, err := socks5.AppendUDPResponse(out[:0], pkt.Address.Host, pkt.Address.Port, pkt.Payload)
 			if err != nil {
 				continue
 			}
@@ -460,39 +556,14 @@ func handleUDP(tcpConn net.Conn, stream io.ReadWriter) {
 	}()
 
 	go func() {
-		discardBuf := make([]byte, 1024)
+		defer func() { done <- struct{}{} }()
+		var discard [256]byte
 		for {
-			_, err := tcpConn.Read(discardBuf)
-			if err != nil {
-				done <- struct{}{}
+			if _, err := tcpConn.Read(discard[:]); err != nil {
 				return
 			}
 		}
 	}()
 
 	<-done
-}
-
-func relay(a, b io.ReadWriter) {
-	// Wait for BOTH directions to complete so neither is truncated when
-	// the caller's deferred Close fires. On finishing one direction,
-	// half-close the peer's write side (when supported) so it observes
-	// EOF and the second copy can drain.
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(b, a)
-		if cw, ok := b.(interface{ CloseWrite() error }); ok {
-			cw.CloseWrite()
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(a, b)
-		if cw, ok := a.(interface{ CloseWrite() error }); ok {
-			cw.CloseWrite()
-		}
-	}()
-	wg.Wait()
 }

@@ -83,7 +83,18 @@ type QUICStreamConn struct {
 
 func (c *QUICStreamConn) Read(b []byte) (int, error)  { return c.stream.Read(b) }
 func (c *QUICStreamConn) Write(b []byte) (int, error) { return c.stream.Write(b) }
-func (c *QUICStreamConn) Close() error                { return c.stream.Close() }
+
+// Close fully releases the stream. quic.Stream.Close only closes the SEND
+// side; the receive side (and its flow-control buffer) would otherwise stay
+// allocated until the peer finishes sending, so a peer that never sends FIN
+// could pin server memory per abandoned stream.
+func (c *QUICStreamConn) Close() error {
+	c.stream.CancelRead(0)
+	return c.stream.Close()
+}
+
+// CloseWrite half-closes the stream (sends FIN) while still allowing reads.
+func (c *QUICStreamConn) CloseWrite() error { return c.stream.Close() }
 
 func (c *QUICStreamConn) LocalAddr() net.Addr  { return c.conn.LocalAddr() }
 func (c *QUICStreamConn) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
@@ -100,15 +111,26 @@ func (c *QUICStreamConn) SetWriteDeadline(t time.Time) error { return c.stream.S
 // once it exceeds quic-go's conservative default stream budget.
 func quicConfig() *quic.Config {
 	return &quic.Config{
-		KeepAlivePeriod:    15 * time.Second,
-		MaxIncomingStreams: 1024,
+		KeepAlivePeriod:      15 * time.Second,
+		MaxIdleTimeout:       60 * time.Second,
+		HandshakeIdleTimeout: 10 * time.Second,
+		MaxIncomingStreams:   1024,
+		// Phantom never uses unidirectional streams; refusing them removes
+		// an unauthenticated resource-consumption vector.
+		MaxIncomingUniStreams: -1,
+		// Larger flow-control ceilings let a single stream fill long fat
+		// pipes (quic-go auto-tunes up to these limits).
+		MaxStreamReceiveWindow:     16 * 1024 * 1024,
+		MaxConnectionReceiveWindow: 32 * 1024 * 1024,
 	}
 }
 
 // DialQUIC establishes a client-side QUIC connection and returns the
 // *quic.Conn session.
 func DialQUIC(addr string, tlsCfg *tls.Config) (*quic.Conn, error) {
-	conn, err := quic.DialAddr(context.Background(), addr, tlsCfg, quicConfig())
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	conn, err := quic.DialAddr(ctx, addr, tlsCfg, quicConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -132,11 +154,17 @@ func AcceptQUICStreams(conn *quic.Conn) chan net.Conn {
 	go func() {
 		defer close(streams)
 		for {
-			stream, err := conn.AcceptStream(context.Background())
+			stream, err := conn.AcceptStream(conn.Context())
 			if err != nil {
 				return
 			}
-			streams <- &QUICStreamConn{stream: stream, conn: conn}
+			select {
+			case streams <- &QUICStreamConn{stream: stream, conn: conn}:
+			case <-conn.Context().Done():
+				stream.CancelRead(0)
+				stream.CancelWrite(0)
+				return
+			}
 		}
 	}()
 	return streams

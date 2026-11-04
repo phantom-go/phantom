@@ -4,9 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strconv"
+	"sync"
 )
 
 const (
@@ -24,8 +27,12 @@ type Address struct {
 	Port uint16
 }
 
+// String returns "host:port". IPv6 literals are bracketed ("[::1]:443") so
+// the result can be fed straight back into net.SplitHostPort / net.Dial.
+// The previous fmt.Sprintf("%s:%d") form produced "::1:443", which
+// SplitHostPort rejects — every IPv6 relay target silently failed.
 func (a *Address) String() string {
-	return fmt.Sprintf("%s:%d", a.Host, a.Port)
+	return net.JoinHostPort(a.Host, strconv.Itoa(int(a.Port)))
 }
 
 type Request struct {
@@ -54,62 +61,78 @@ func ResolveAddress(host string, port uint16) (Address, error) {
 	return resolveAddress(host, port)
 }
 
+// HashLength is the length of the hex-encoded SHA-224 password hash.
+const HashLength = 56
+
+var crlf = [2]byte{'\r', '\n'}
+
+var errInvalidCRLF = errors.New("invalid CRLF")
+
 // ParseHeader parses the incoming Trojan handshake header from the client (Server side).
+//
+// The fixed-size prefix (hash + CRLF + command) is read with a single
+// ReadFull into a stack buffer, cutting the number of Read calls (each of
+// which goes through the TLS/smux/rewind layers) and heap allocations.
 func ParseHeader(r io.Reader) (*Header, error) {
-	hash := make([]byte, 56)
-	_, err := io.ReadFull(r, hash)
+	sp := scratchPool.Get().(*scratch)
+	defer scratchPool.Put(sp)
+	fixed := sp[:HashLength+2+1]
+	if _, err := io.ReadFull(r, fixed); err != nil {
+		return nil, err
+	}
+	if fixed[HashLength] != '\r' || fixed[HashLength+1] != '\n' {
+		return nil, errInvalidCRLF
+	}
+	h := &Header{PasswordHash: string(fixed[:HashLength])}
+	h.Request.Command = fixed[HashLength+2]
+
+	addr, err := readAddressScratch(r, sp)
 	if err != nil {
 		return nil, err
 	}
+	h.Request.Address = addr
 
-	err = readCRLF(r)
+	if err := readCRLFScratch(r, sp); err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+
+// scratch is a reusable read buffer large enough for any address
+// (1 + 1 + 255 + 2) or the fixed header prefix. Pooling it keeps the
+// per-handshake reads off the heap (stack arrays escape through io.Reader).
+type scratch [512]byte
+
+var scratchPool = sync.Pool{New: func() any { return new(scratch) }}
+
+// AppendHeader appends the wire encoding of h to buf.
+func AppendHeader(buf []byte, h *Header) ([]byte, error) {
+	buf = append(buf, h.PasswordHash...)
+	buf = append(buf, crlf[:]...)
+	buf = append(buf, h.Request.Command)
+	buf, err := appendAddress(buf, h.Request.Address)
 	if err != nil {
 		return nil, err
 	}
-
-	var cmd [1]byte
-	_, err = io.ReadFull(r, cmd[:])
-	if err != nil {
-		return nil, err
-	}
-
-	addr, err := readAddress(r)
-	if err != nil {
-		return nil, err
-	}
-
-	err = readCRLF(r)
-	if err != nil {
-		return nil, err
-	}
-
-	return &Header{
-		PasswordHash: string(hash),
-		Request: Request{
-			Command: cmd[0],
-			Address: addr,
-		},
-	}, nil
+	return append(buf, crlf[:]...), nil
 }
 
 // WriteHeader writes the Trojan handshake header to the server (Client side).
+//
+// The header is encoded into one buffer and emitted with a single Write.
+// Previously it was five separate Writes; over smux each Write becomes its
+// own frame (8-byte header + scheduling) and over raw TLS its own record,
+// so the handshake cost 5 frames/records instead of 1 — and the
+// distinctive burst of tiny records was also a traffic-analysis signal.
 func WriteHeader(w io.Writer, h *Header) error {
-	if _, err := w.Write([]byte(h.PasswordHash)); err != nil {
+	sp := scratchPool.Get().(*scratch)
+	defer scratchPool.Put(sp)
+	buf, err := AppendHeader(sp[:0], h)
+	if err != nil {
 		return err
 	}
-	if _, err := w.Write([]byte("\r\n")); err != nil {
-		return err
-	}
-	if _, err := w.Write([]byte{h.Request.Command}); err != nil {
-		return err
-	}
-	if err := writeAddress(w, h.Request.Address); err != nil {
-		return err
-	}
-	if _, err := w.Write([]byte("\r\n")); err != nil {
-		return err
-	}
-	return nil
+	_, err = w.Write(buf)
+	return err
 }
 
 // MaxUDPPayloadLength caps individual UDP packet payloads to bound the
@@ -162,148 +185,144 @@ func ReadUDPPacket(r io.Reader) (*UDPPacket, error) {
 	}, nil
 }
 
+// udpBufPool recycles encode buffers for WriteUDPPacket. Sized for the
+// largest frame: atyp + len + 255-byte domain + port + length + payload + CRLF.
+var udpBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 1+1+255+2+2+MaxUDPPayloadLength+2)
+		return &b
+	},
+}
+
 // WriteUDPPacket encapsulates and writes data into the Trojan UDP format.
+//
+// The whole frame is assembled in a pooled buffer and written once, so each
+// datagram costs exactly one smux frame / TLS record / QUIC STREAM write
+// instead of five, and no per-packet allocation.
 func WriteUDPPacket(w io.Writer, host string, port uint16, payload []byte) error {
+	if len(payload) > MaxUDPPayloadLength {
+		return fmt.Errorf("udp payload too large: %d (max %d)", len(payload), MaxUDPPayloadLength)
+	}
 	addr, err := resolveAddress(host, port)
 	if err != nil {
 		return err
 	}
 
-	if err := writeAddress(w, addr); err != nil {
-		return err
-	}
+	bp := udpBufPool.Get().(*[]byte)
+	defer udpBufPool.Put(bp)
 
-	var lenBuf [2]byte
-	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(payload)))
-	if _, err := w.Write(lenBuf[:]); err != nil {
-		return err
-	}
-
-	if _, err := w.Write(payload); err != nil {
-		return err
-	}
-
-	if _, err := w.Write([]byte("\r\n")); err != nil {
-		return err
-	}
-	return nil
-}
-
-func readCRLF(r io.Reader) error {
-	buf := make([]byte, 2)
-	_, err := io.ReadFull(r, buf)
+	buf, err := appendAddress((*bp)[:0], addr)
 	if err != nil {
 		return err
 	}
-	if buf[0] != '\r' || buf[1] != '\n' {
-		return fmt.Errorf("invalid CRLF")
+	buf = binary.BigEndian.AppendUint16(buf, uint16(len(payload)))
+	buf = append(buf, payload...)
+	buf = append(buf, crlf[:]...)
+	*bp = buf[:0]
+
+	_, err = w.Write(buf)
+	return err
+}
+
+func readCRLF(r io.Reader) error {
+	sp := scratchPool.Get().(*scratch)
+	defer scratchPool.Put(sp)
+	return readCRLFScratch(r, sp)
+}
+
+func readCRLFScratch(r io.Reader, sp *scratch) error {
+	if _, err := io.ReadFull(r, sp[:2]); err != nil {
+		return err
+	}
+	if sp[0] != '\r' || sp[1] != '\n' {
+		return errInvalidCRLF
 	}
 	return nil
 }
 
 func readAddress(r io.Reader) (Address, error) {
-	var atyp [1]byte
-	_, err := io.ReadFull(r, atyp[:])
-	if err != nil {
+	sp := scratchPool.Get().(*scratch)
+	defer scratchPool.Put(sp)
+	return readAddressScratch(r, sp)
+}
+
+func readAddressScratch(r io.Reader, sp *scratch) (Address, error) {
+	head := sp[:2]
+	if _, err := io.ReadFull(r, head[:1]); err != nil {
 		return Address{}, err
 	}
 
-	addr := Address{
-		Type: atyp[0],
-	}
+	addr := Address{Type: head[0]}
 
-	switch atyp[0] {
+	switch head[0] {
 	case AtypIPv4:
-		ip := make([]byte, 4)
-		_, err = io.ReadFull(r, ip)
-		if err != nil {
+		b := sp[2 : 2+4+2]
+		if _, err := io.ReadFull(r, b); err != nil {
 			return Address{}, err
 		}
-		addr.Host = net.IP(ip).String()
+		addr.Host = net.IP(b[:4]).String()
+		addr.Port = binary.BigEndian.Uint16(b[4:])
 
 	case AtypIPv6:
-		ip := make([]byte, 16)
-		_, err = io.ReadFull(r, ip)
-		if err != nil {
+		b := sp[2 : 2+16+2]
+		if _, err := io.ReadFull(r, b); err != nil {
 			return Address{}, err
 		}
-		addr.Host = net.IP(ip).String()
+		addr.Host = net.IP(b[:16]).String()
+		addr.Port = binary.BigEndian.Uint16(b[16:])
 
 	case AtypDomain:
-		var length [1]byte
-		_, err = io.ReadFull(r, length[:])
-		if err != nil {
+		if _, err := io.ReadFull(r, head[1:2]); err != nil {
 			return Address{}, err
 		}
-		if length[0] == 0 {
+		n := int(head[1])
+		if n == 0 {
 			return Address{}, fmt.Errorf("empty domain name")
 		}
-		domain := make([]byte, length[0])
-		_, err = io.ReadFull(r, domain)
-		if err != nil {
+		b := sp[2 : 2+n+2]
+		if _, err := io.ReadFull(r, b); err != nil {
 			return Address{}, err
 		}
-		addr.Host = string(domain)
+		addr.Host = string(b[:n])
+		addr.Port = binary.BigEndian.Uint16(b[n : n+2])
 
 	default:
-		return Address{}, fmt.Errorf("unsupported address type: %d", atyp[0])
+		return Address{}, fmt.Errorf("unsupported address type: %d", head[0])
 	}
-
-	var portBuf [2]byte
-	_, err = io.ReadFull(r, portBuf[:])
-	if err != nil {
-		return Address{}, err
-	}
-	addr.Port = binary.BigEndian.Uint16(portBuf[:])
 
 	return addr, nil
 }
 
-func writeAddress(w io.Writer, addr Address) error {
-	if _, err := w.Write([]byte{addr.Type}); err != nil {
-		return err
-	}
+func appendAddress(buf []byte, addr Address) ([]byte, error) {
+	buf = append(buf, addr.Type)
 
 	switch addr.Type {
 	case AtypIPv4:
 		ip := net.ParseIP(addr.Host).To4()
 		if ip == nil {
-			return fmt.Errorf("invalid ipv4 address")
+			return nil, fmt.Errorf("invalid ipv4 address")
 		}
-		if _, err := w.Write(ip); err != nil {
-			return err
-		}
+		buf = append(buf, ip...)
 	case AtypIPv6:
 		ip := net.ParseIP(addr.Host).To16()
 		if ip == nil {
-			return fmt.Errorf("invalid ipv6 address")
+			return nil, fmt.Errorf("invalid ipv6 address")
 		}
-		if _, err := w.Write(ip); err != nil {
-			return err
-		}
+		buf = append(buf, ip...)
 	case AtypDomain:
 		if len(addr.Host) == 0 {
-			return fmt.Errorf("empty domain name")
+			return nil, fmt.Errorf("empty domain name")
 		}
 		if len(addr.Host) > 255 {
-			return fmt.Errorf("domain name too long")
+			return nil, fmt.Errorf("domain name too long")
 		}
-		if _, err := w.Write([]byte{byte(len(addr.Host))}); err != nil {
-			return err
-		}
-		if _, err := w.Write([]byte(addr.Host)); err != nil {
-			return err
-		}
+		buf = append(buf, byte(len(addr.Host)))
+		buf = append(buf, addr.Host...)
 	default:
-		return fmt.Errorf("unsupported address type: %d", addr.Type)
+		return nil, fmt.Errorf("unsupported address type: %d", addr.Type)
 	}
 
-	var portBuf [2]byte
-	binary.BigEndian.PutUint16(portBuf[:], addr.Port)
-	if _, err := w.Write(portBuf[:]); err != nil {
-		return err
-	}
-	return nil
+	return binary.BigEndian.AppendUint16(buf, addr.Port), nil
 }
 
 func resolveAddress(host string, port uint16) (Address, error) {

@@ -18,14 +18,18 @@ type StaticAuth struct {
 	// A slice (not a map) is used so Verify can compare against every
 	// entry in constant time rather than via a timing-variable map
 	// lookup.
-	hashes []string
+	// Stored as []byte so Verify does not allocate a copy per entry per
+	// connection.
+	hashes [][]byte
 }
 
-func hashPasswords(passwords []string) []string {
-	out := make([]string, 0, len(passwords))
+func hashPasswords(passwords []string) [][]byte {
+	out := make([][]byte, 0, len(passwords))
 	for _, password := range passwords {
 		h := sha256.Sum224([]byte(password))
-		out = append(out, hex.EncodeToString(h[:]))
+		enc := make([]byte, hex.EncodedLen(len(h)))
+		hex.Encode(enc, h[:])
+		out = append(out, enc)
 	}
 	return out
 }
@@ -45,13 +49,14 @@ func (a *StaticAuth) Verify(hash string) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	hb := []byte(hash)
+	var stack [64]byte
+	hb := append(stack[:0], hash...)
 	var match int
 	for _, known := range a.hashes {
 		// ConstantTimeCompare returns 1 only when lengths match and all
 		// bytes are equal; length differs only for malformed input, and
 		// the hash length is not secret.
-		match |= subtle.ConstantTimeCompare(hb, []byte(known))
+		match |= subtle.ConstantTimeCompare(hb, known)
 	}
 	return match == 1
 }

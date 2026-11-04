@@ -156,6 +156,13 @@ func ParseUDPHeader(data []byte) (*UDPPacket, error) {
 		return nil, fmt.Errorf("udp header too short")
 	}
 
+	// FRAG != 0 means a fragment of a larger datagram. Fragmentation is
+	// optional in RFC 1928 and unsupported here; forwarding the fragment
+	// as if it were a whole datagram would corrupt the stream.
+	if data[2] != 0 {
+		return nil, fmt.Errorf("fragmented socks5 udp datagrams are not supported")
+	}
+
 	atyp := data[3]
 	var host string
 	offset := 4
@@ -199,7 +206,12 @@ func ParseUDPHeader(data []byte) (*UDPPacket, error) {
 }
 
 func NewUDPResponseHeader(host string, port uint16, payload []byte) ([]byte, error) {
-	buf := make([]byte, 0, 4+len(host)+2+len(payload))
+	return AppendUDPResponse(make([]byte, 0, 4+len(host)+2+len(payload)), host, port, payload)
+}
+
+// AppendUDPResponse is NewUDPResponseHeader appending into buf, so the hot UDP
+// path can reuse one buffer instead of allocating per datagram.
+func AppendUDPResponse(buf []byte, host string, port uint16, payload []byte) ([]byte, error) {
 	buf = append(buf, 0x00, 0x00, 0x00) // RSV (2 bytes) + FRAG (1 byte)
 
 	if ip := net.ParseIP(host); ip != nil {

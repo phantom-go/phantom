@@ -158,29 +158,36 @@ download_phantom() {
         *)       error "Unsupported architecture: $ARCH" ;;
     esac
 
-    URL="https://github.com/phantom-go/phantom/releases/download/${PHANTOM_VERSION}/phantom-${PHANTOM_VERSION}-linux-${ARCH}.tar.gz"
+    local base="https://github.com/phantom-go/phantom/releases/download/${PHANTOM_VERSION}"
+    local archive="phantom-${PHANTOM_VERSION}-linux-${ARCH}.tar.gz"
+    URL="${base}/${archive}"
 
-    # -f makes curl return non-zero on HTTP errors (404/5xx); without it a
-    # "Not Found" HTML page would be saved as phantom.tar.gz and the tar
-    # extraction below would fail with a confusing error instead of a clear
-    # download failure.
-    if ! curl -fsSL "$URL" -o /tmp/phantom.tar.gz; then
+    # Private, unpredictable work dir. The previous fixed /tmp/phantom.tar.gz
+    # and /tmp/phantom-server paths let any local user pre-plant a file or
+    # symlink there and have root install it as the server binary.
+    local work
+    work=$(mktemp -d) || error "mktemp failed"
+    trap 'rm -rf "$work"' RETURN
+
+    if ! curl -fsSL --proto '=https' --tlsv1.2 "$URL" -o "$work/$archive"; then
         error "Failed to download binary from GitHub ($URL). Check the version tag and network connection."
     fi
 
-    if ! tar -xzf /tmp/phantom.tar.gz -C /tmp; then
-        rm -f /tmp/phantom.tar.gz
-        error "Downloaded archive is corrupt or not a gzip tarball."
+    # Verify integrity against the release's SHA256SUMS (published by CI).
+    if curl -fsSL --proto '=https' --tlsv1.2 "${base}/SHA256SUMS" -o "$work/SHA256SUMS"; then
+        if ! (cd "$work" && grep " ${archive}\$" SHA256SUMS | sha256sum -c --status -); then
+            error "Checksum verification FAILED for $archive. Aborting."
+        fi
+        info "Checksum verified."
+    else
+        warn "Release has no SHA256SUMS (older release); integrity not verified."
     fi
 
-    if [ ! -f /tmp/phantom-server ]; then
-        rm -f /tmp/phantom.tar.gz
-        error "Archive did not contain phantom-server. Aborting to avoid a broken install."
+    if ! tar -xzf "$work/$archive" -C "$work" --no-same-owner phantom-server; then
+        error "Downloaded archive is corrupt or does not contain phantom-server."
     fi
 
-    mv /tmp/phantom-server "$PHANTOM_DIR/phantom-server"
-    chmod +x "$PHANTOM_DIR/phantom-server"
-    rm -f /tmp/phantom.tar.gz /tmp/phantom-client 2>/dev/null || true
+    install -m 0755 -o root -g root "$work/phantom-server" "$PHANTOM_DIR/phantom-server"
     info "phantom-server installed to $PHANTOM_DIR/phantom-server"
 }
 
@@ -259,6 +266,15 @@ EOF
         certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos \
             --register-unsafely-without-email 2>/dev/null || true
         systemctl start nginx
+        # phantom-server reloads its certificate on SIGHUP. Without this hook
+        # a renewed certificate was never picked up and clients broke when
+        # the old one expired (~90 days after install).
+        mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+        cat > /etc/letsencrypt/renewal-hooks/deploy/phantom-reload.sh <<'HOOK'
+#!/bin/sh
+systemctl reload phantom-server-tcp phantom-server-quic 2>/dev/null || true
+HOOK
+        chmod 755 /etc/letsencrypt/renewal-hooks/deploy/phantom-reload.sh
     fi
     info "Nginx fallback environment configured."
 }
@@ -287,14 +303,18 @@ generate_config() {
         fi
         CERT_FILE="$CONFIG_DIR/server.crt"
         KEY_FILE="$CONFIG_DIR/server.key"
-        openssl req -x509 -newkey rsa:2048 \
+        # ECDSA P-256: faster handshakes and smaller certs than RSA-2048.
+        # 10-year validity: a self-signed cert is trusted by pinning its
+        # fingerprint, so expiry only causes an outage, never adds security.
+        (umask 077 && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
             -keyout "$KEY_FILE" \
             -out "$CERT_FILE" \
-            -days 365 -nodes \
-            -subj "/CN=phantom" 2>/dev/null
+            -days 3650 -nodes \
+            -subj "/CN=phantom" 2>/dev/null)
         chmod 600 "$KEY_FILE"
     fi
 
+    install -m 600 /dev/null "$CONFIG_DIR/config.json"
     cat > "$CONFIG_DIR/config.json" <<EOF
 {
   "server": {
@@ -353,14 +373,46 @@ install_service() {
     cat > "$SERVICE_FILE_TCP" <<EOF
 [Unit]
 Description=Phantom Proxy Server (TCP/TLS)
-After=network.target nginx.service
+Wants=network-online.target
+After=network-online.target nginx.service
 
 [Service]
 Type=simple
 ExecStart=$PHANTOM_DIR/phantom-server --config $CONFIG_DIR/config.json
-Restart=on-failure
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=always
 RestartSec=5s
-LimitNOFILE=65536
+LimitNOFILE=1048576
+
+# --- Sandboxing (unknown keys are ignored by older systemd) ---
+# Runs as root only so it can read root-owned certificates; every root
+# capability except binding to :443 is dropped.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
@@ -369,14 +421,46 @@ EOF
     cat > "$SERVICE_FILE_QUIC" <<EOF
 [Unit]
 Description=Phantom Proxy Server (QUIC)
-After=network.target nginx.service
+Wants=network-online.target
+After=network-online.target nginx.service
 
 [Service]
 Type=simple
 ExecStart=$PHANTOM_DIR/phantom-server --quic --config $CONFIG_DIR/config.json
-Restart=on-failure
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=always
 RestartSec=5s
-LimitNOFILE=65536
+LimitNOFILE=1048576
+
+# --- Sandboxing (unknown keys are ignored by older systemd) ---
+# Runs as root only so it can read root-owned certificates; every root
+# capability except binding to :443 is dropped.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
@@ -411,32 +495,35 @@ print_info() {
     echo ""
     echo "  Server  : $HOST:443"
     echo "  Password: $PASSWORD"
+    if [ "$ALLOW_INSECURE" = 1 ] && [ -f "$CERT_FILE" ]; then
+        CERT_PIN=$(openssl x509 -in "$CERT_FILE" -noout -fingerprint -sha256 | cut -d= -f2)
+        echo "  Cert SHA-256 (client \"pinned_cert_sha256\", blocks MITM):"
+        echo "    $CERT_PIN"
+    fi
     echo "  Mode    : TCP + QUIC dual stack (port 443)"
     echo ""
-    echo -e "${GREEN}  Native URI — TCP (recommended):${NC}"
+    echo -e "${GREEN}  Phantom URI — TCP (recommended):${NC}"
     echo "  $PHANTOM_URI"
     echo ""
-    echo -e "${GREEN}  Native URI — QUIC:${NC}"
+    echo -e "${GREEN}  Phantom URI — QUIC:${NC}"
     echo "  $PHANTOM_URI_QUIC"
     echo -e "${YELLOW}  (for the bundled Go client, set transport=\"quic\" in its${NC}"
     echo -e "${YELLOW}   config or pass --quic; the type= parameter mirrors this.)${NC}"
     echo ""
     if command -v qrencode &>/dev/null; then
-        echo "  [Native QR Code]"
+        echo "  [Phantom QR Code]"
         qrencode -t ANSIUTF8 "$PHANTOM_URI"
         echo ""
     fi
-    echo -e "${YELLOW}  Legacy compatibility URI (Trojan clients):${NC}"
+    echo -e "${YELLOW}  Compatibility URI (temporary):${NC}"
     echo "  $TROJAN_URI"
     echo ""
-    echo -e "${YELLOW}  Note: Trojan compatibility mode does not support all${NC}"
-    echo -e "${YELLOW}  Phantom features (QUIC, metrics, hot reload).${NC}"
-    echo -e "${YELLOW}  Native Phantom clients will be available soon.${NC}"
+    print_trojan_notice
     echo ""
     echo "============================================================"
     echo ""
     info "Config saved at: $CONFIG_DIR/config.json"
-    info "To reload config: systemctl kill -s HUP phantom-server-tcp phantom-server-quic"
+    info "To reload config: systemctl reload phantom-server-tcp phantom-server-quic"
     info "To check status:  systemctl status phantom-server-tcp phantom-server-quic"
     echo ""
 }
@@ -553,6 +640,13 @@ reload_service() {
     fi
 }
 
+# Shown under every trojan:// link.
+print_trojan_notice() {
+    echo -e "${YELLOW}  Note: trojan:// is a temporary compatibility option for apps${NC}"
+    echo -e "${YELLOW}  without phantom:// support. Basic proxying only; it may be${NC}"
+    echo -e "${YELLOW}  removed in a future release. Prefer the phantom:// link.${NC}"
+}
+
 # Render a single (password -> URI + QR) block. Used by [3] Show users
 # after a user is added and during install. Reads HOST / ALLOW_INSECURE
 # from globals — caller must invoke resolve_host_mode first.
@@ -570,15 +664,17 @@ print_uri_block() {
     fi
     echo "  Password : $password"
     echo ""
-    echo -e "  ${GREEN}Native URI:${NC}"
+    echo -e "  ${GREEN}Phantom URI (recommended):${NC}"
     echo "  $phantom_uri"
     echo ""
     if command -v qrencode &>/dev/null; then
         qrencode -t ANSIUTF8 "$phantom_uri"
     fi
     echo ""
-    echo -e "  ${YELLOW}Trojan-compatible URI:${NC}"
+    echo -e "  ${YELLOW}Compatibility URI (temporary):${NC}"
     echo "  $trojan_uri"
+    echo ""
+    print_trojan_notice
     echo "------------------------------------------------------------"
 }
 

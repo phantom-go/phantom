@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 
@@ -43,6 +44,8 @@ func DialWS(ctx context.Context, rawConn net.Conn, serverAddr, wsPath string) (n
 				return rawConn, nil
 			},
 		},
+		// Do not follow redirects off the authenticated tunnel.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 
 	options := &websocket.DialOptions{
@@ -83,37 +86,59 @@ func AcceptWS(w http.ResponseWriter, r *http.Request, trustProxyHeaders bool) (n
 
 	nc := websocket.NetConn(context.Background(), wsConn, websocket.MessageBinary)
 
-	remoteAddrStr := ""
+	return &wsConnWrapper{Conn: nc, remoteAddr: ClientAddr(r, trustProxyHeaders)}, nil
+}
+
+// ClientAddr determines the address used for rate limiting.
+//
+// Security notes:
+//   - Only when trustProxyHeaders is set are proxy headers consulted.
+//   - X-Real-IP is preferred: Nginx/Caddy set it to the socket peer and it
+//     cannot carry client-supplied history.
+//   - For X-Forwarded-For the RIGHT-most entry is used. Proxies APPEND the
+//     peer they saw (nginx $proxy_add_x_forwarded_for), so the left-most
+//     entry is whatever the client sent — trusting it (as the previous code
+//     did) let any client choose its own rate-limit identity and frame
+//     innocent IPs for bans even behind a correctly configured proxy.
+//   - Header values are parsed with netip (pure parsing). The old code used
+//     net.ResolveTCPAddr, which performs a DNS lookup for a hostname — a
+//     client-controlled header could make the server issue arbitrary DNS
+//     queries and block the handler on resolution.
+func ClientAddr(r *http.Request, trustProxyHeaders bool) net.Addr {
 	if trustProxyHeaders {
-		// Extract the real remote address from proxy headers. Only the
-		// first comma-separated XFF value is used — that's the original
-		// client per the de-facto standard.
-		remoteAddrStr = r.Header.Get("X-Forwarded-For")
-		if remoteAddrStr != "" {
-			if idx := strings.Index(remoteAddrStr, ","); idx != -1 {
-				remoteAddrStr = remoteAddrStr[:idx]
+		if ap, ok := parseHeaderIP(r.Header.Get("X-Real-IP")); ok {
+			return net.TCPAddrFromAddrPort(ap)
+		}
+		if xff := r.Header.Values("X-Forwarded-For"); len(xff) > 0 {
+			last := xff[len(xff)-1]
+			if idx := strings.LastIndexByte(last, ','); idx != -1 {
+				last = last[idx+1:]
 			}
-			remoteAddrStr = strings.TrimSpace(remoteAddrStr)
-		} else {
-			remoteAddrStr = r.Header.Get("X-Real-IP")
+			if ap, ok := parseHeaderIP(last); ok {
+				return net.TCPAddrFromAddrPort(ap)
+			}
 		}
 	}
-
-	// Fallback (and default when not trusting proxy headers) to the
-	// transport-level remote address.
-	if remoteAddrStr == "" {
-		remoteAddrStr = r.RemoteAddr
+	if ap, err := netip.ParseAddrPort(r.RemoteAddr); err == nil {
+		return net.TCPAddrFromAddrPort(ap)
 	}
-
-	// If the address does not have a port, append a dummy one to satisfy net.ResolveTCPAddr
-	if _, _, err := net.SplitHostPort(remoteAddrStr); err != nil {
-		remoteAddrStr = remoteAddrStr + ":0"
+	if ap, ok := parseHeaderIP(r.RemoteAddr); ok {
+		return net.TCPAddrFromAddrPort(ap)
 	}
+	return &net.TCPAddr{}
+}
 
-	remoteAddr, err := net.ResolveTCPAddr("tcp", remoteAddrStr)
-	if err != nil {
-		remoteAddr, _ = net.ResolveTCPAddr("tcp", r.RemoteAddr)
+func parseHeaderIP(v string) (netip.AddrPort, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return netip.AddrPort{}, false
 	}
-
-	return &wsConnWrapper{Conn: nc, remoteAddr: remoteAddr}, nil
+	if ap, err := netip.ParseAddrPort(v); err == nil {
+		return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()), true
+	}
+	v = strings.TrimSuffix(strings.TrimPrefix(v, "["), "]")
+	if a, err := netip.ParseAddr(v); err == nil {
+		return netip.AddrPortFrom(a.Unmap(), 0), true
+	}
+	return netip.AddrPort{}, false
 }
