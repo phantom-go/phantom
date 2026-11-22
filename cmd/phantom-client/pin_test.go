@@ -32,13 +32,13 @@ func pinServer(t *testing.T) (string, []byte) {
 func TestUTLSPinning(t *testing.T) {
 	addr, good := pinServer(t)
 	for _, fp := range []string{"HelloChrome_Auto", "HelloFirefox_Auto", "HelloRandomized"} {
-		if c, err := dialUTLS(addr, fp, false, good); err != nil {
+		if c, err := dialUTLS(addr, fp, false, good, nil); err != nil {
 			t.Errorf("%s: correct pin rejected: %v", fp, err)
 		} else {
 			c.Close()
 		}
 		bad := make([]byte, 32)
-		if c, err := dialUTLS(addr, fp, false, bad); err == nil {
+		if c, err := dialUTLS(addr, fp, false, bad, nil); err == nil {
 			c.Close()
 			t.Errorf("%s: WRONG pin accepted", fp)
 		}

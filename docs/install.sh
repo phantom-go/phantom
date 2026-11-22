@@ -21,6 +21,9 @@ prompt()  { echo -e "${BLUE}[?]${NC} $1"; }
 PHANTOM_VERSION="${PHANTOM_VERSION:-}"
 PHANTOM_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/phantom"
+TLS_DIR="/etc/phantom/tls"
+PHANTOM_USER="phantom"
+DOMAIN_FILE="/etc/phantom/domain"
 SERVICE_FILE_TCP="/etc/systemd/system/phantom-server-tcp.service"
 SERVICE_FILE_QUIC="/etc/systemd/system/phantom-server-quic.service"
 # Legacy single-mode unit from <=1.0.x installs. Removed on (re)install
@@ -223,10 +226,38 @@ EOF
         rm -f /etc/nginx/conf.d/welcome.conf 2>/dev/null || true
     fi
 
+    # Two backends for the fallback site: HTTP/1.1 on :8080 and HTTP/2
+    # (prior knowledge) on :8081. phantom-server sends a prober to the one
+    # matching the ALPN it negotiated, so h2 probers get a real HTTP/2 reply.
+    # Alt-Svc advertises HTTP/3, as any site that serves QUIC on :443 does.
+    NGINX_H2=true
+    local h2_listen="listen 127.0.0.1:8081 http2 default_server;"
+    local h2_on=""
+    if [ "$(nginx_http2_style)" = "on" ]; then
+        h2_listen="listen 127.0.0.1:8081 default_server;"
+        h2_on="http2 on;"
+    fi
     cat > "$nginx_conf" <<EOF
 server {
     listen 127.0.0.1:8080 default_server;
     server_name _;
+    server_tokens off;
+    add_header Alt-Svc 'h3=":443"; ma=86400' always;
+
+    root $WEB_ROOT;
+    index index.html index.htm index.nginx-debian.html;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+
+server {
+    $h2_listen
+    $h2_on
+    server_name _;
+    server_tokens off;
+    add_header Alt-Svc 'h3=":443"; ma=86400' always;
 
     root $WEB_ROOT;
     index index.html index.htm index.nginx-debian.html;
@@ -243,10 +274,13 @@ EOF
 
     if ! nginx -t 2>/dev/null; then
         warn "Modern HTTP/2 syntax not supported, falling back to HTTP/1.1 only."
+        NGINX_H2=false
         cat > "$nginx_conf" <<EOF
 server {
     listen 127.0.0.1:8080 default_server;
     server_name _;
+    server_tokens off;
+    add_header Alt-Svc 'h3=":443"; ma=86400' always;
 
     root $WEB_ROOT;
     index index.html index.htm index.nginx-debian.html;
@@ -266,10 +300,6 @@ EOF
         certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos \
             --register-unsafely-without-email 2>/dev/null || true
         systemctl start nginx
-        # phantom-server reloads its certificate on SIGHUP. Without this hook
-        # a renewed certificate was never picked up and clients broke when
-        # the old one expired (~90 days after install).
-        install_cert_hook
     fi
     info "Nginx fallback environment configured."
 }
@@ -288,28 +318,38 @@ generate_config() {
         PASSWORD=$(openssl rand -hex 16 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/')
     fi
 
+    install -d -m 750 -o root -g "$PHANTOM_USER" "$TLS_DIR"
+    CERT_FILE="$TLS_DIR/cert.pem"
+    KEY_FILE="$TLS_DIR/key.pem"
+    rm -f "$DOMAIN_FILE"
+
     if [ "$USE_DOMAIN" = true ] && [ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
-        CERT_FILE="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-        KEY_FILE="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+        install_cert_hook "$DOMAIN"   # copies the cert into $TLS_DIR
+        echo "$DOMAIN" > "$DOMAIN_FILE"
     else
         if [ "$USE_DOMAIN" = true ]; then
             warn "Certbot failed to obtain certificate. Falling back to self-signed."
             USE_DOMAIN=false
         fi
-        CERT_FILE="$CONFIG_DIR/server.crt"
-        KEY_FILE="$CONFIG_DIR/server.key"
         # ECDSA P-256: faster handshakes and smaller certs than RSA-2048.
         # 10-year validity: a self-signed cert is trusted by pinning its
         # fingerprint, so expiry only causes an outage, never adds security.
+        # The subject is the server's own IP, like a typical appliance
+        # default certificate — nothing names Phantom (anyone who connects
+        # can read a certificate, so "CN=phantom" identified the server).
+        local san="IP:$SERVER_IP"
+        echo "$SERVER_IP" | grep -qE '^[0-9a-fA-F:.]+$' || san="DNS:localhost"
         (umask 077 && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
             -keyout "$KEY_FILE" \
             -out "$CERT_FILE" \
             -days 3650 -nodes \
-            -subj "/CN=phantom" 2>/dev/null)
-        chmod 600 "$KEY_FILE"
+            -subj "/CN=$SERVER_IP" \
+            -addext "subjectAltName=$san" 2>/dev/null)
     fi
 
-    install -m 600 /dev/null "$CONFIG_DIR/config.json"
+    FALLBACK_H2="127.0.0.1:8081"
+    [ "${NGINX_H2:-true}" = true ] || FALLBACK_H2=""
+    install -m 640 -o root -g "$PHANTOM_USER" /dev/null "$CONFIG_DIR/config.json"
     cat > "$CONFIG_DIR/config.json" <<EOF
 {
   "server": {
@@ -317,11 +357,14 @@ generate_config() {
     "passwords": ["$PASSWORD"],
     "cert_file": "$CERT_FILE",
     "key_file": "$KEY_FILE",
-    "fallback_addr": "127.0.0.1:8080"
+    "fallback_addr": "127.0.0.1:8080",
+    "fallback_h2_addr": "$FALLBACK_H2",
+    "dns_over_tls": ["9.9.9.9", "149.112.112.112"],
+    "dns_tls_name": "dns.quad9.net"
   }
 }
 EOF
-    chmod 600 "$CONFIG_DIR/config.json"
+    fix_permissions
     info "Config generated at $CONFIG_DIR/config.json"
 }
 
@@ -353,6 +396,59 @@ configure_firewall() {
 }
 
 # ============================================================
+# 9a. Unprivileged service account and file permissions
+#
+# phantom-server runs as the "phantom" system user with only
+# CAP_NET_BIND_SERVICE. Before 2.0 it ran as root (capability-restricted),
+# and root can still read every root-owned file — /etc/shadow, SSH host
+# private keys — so a hypothetical remote-code-execution bug would have
+# exposed them. The user can read only its own config and certificate.
+# ============================================================
+ensure_user() {
+    if ! id -u "$PHANTOM_USER" >/dev/null 2>&1; then
+        useradd --system --no-create-home --home-dir /nonexistent \
+            --shell /usr/sbin/nologin "$PHANTOM_USER" 2>/dev/null \
+            || useradd -r -M -s /sbin/nologin "$PHANTOM_USER"
+        info "Created system user '$PHANTOM_USER'."
+    fi
+}
+
+fix_permissions() {
+    chown root:"$PHANTOM_USER" "$CONFIG_DIR" && chmod 750 "$CONFIG_DIR"
+    if [ -f "$CONFIG_DIR/config.json" ]; then
+        chown root:"$PHANTOM_USER" "$CONFIG_DIR/config.json"
+        chmod 640 "$CONFIG_DIR/config.json"
+    fi
+    if [ -d "$TLS_DIR" ]; then
+        chown root:"$PHANTOM_USER" "$TLS_DIR" && chmod 750 "$TLS_DIR"
+        for f in "$TLS_DIR"/*; do
+            [ -f "$f" ] && chown root:"$PHANTOM_USER" "$f" && chmod 640 "$f"
+        done
+    fi
+    # Pre-2.0 self-signed files lived directly in $CONFIG_DIR.
+    for f in "$CONFIG_DIR/server.crt" "$CONFIG_DIR/server.key"; do
+        [ -f "$f" ] && chown root:"$PHANTOM_USER" "$f" && chmod 640 "$f"
+    done
+    # Backups contain passwords too.
+    for f in "$CONFIG_DIR"/config.json.bak*; do
+        [ -f "$f" ] && chown root:root "$f" && chmod 600 "$f"
+    done
+    return 0
+}
+
+# Prints "on" when nginx supports the `http2 on;` directive (>= 1.25.1),
+# "listen" when it needs the older `listen ... http2` form.
+nginx_http2_style() {
+    local v
+    v=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [ -n "$v" ] && [ "$(printf '%s\n1.25.1\n' "$v" | sort -V | head -1)" = "1.25.1" ]; then
+        echo on
+    else
+        echo listen
+    fi
+}
+
+# ============================================================
 # 9b. Kernel network tuning
 #
 # quic-go wants 7 MiB UDP socket buffers. It used to get them through
@@ -377,15 +473,29 @@ configure_sysctl() {
     info "Network tuning applied ($conf)."
 }
 
-# Reload phantom-server after every certbot renewal (SIGHUP reloads the cert).
+# After every certbot renewal, copy the certificate to where the unprivileged
+# service can read it, then reload (SIGHUP reloads the certificate without
+# dropping connections). Other certificates on the host are ignored.
 install_cert_hook() {
+    local domain="$1"
+    [ -n "$domain" ] || return 0
     [ -d /etc/letsencrypt ] || return 0
     mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-    cat > /etc/letsencrypt/renewal-hooks/deploy/phantom-reload.sh <<'HOOK'
+    cat > /etc/letsencrypt/renewal-hooks/deploy/phantom-reload.sh <<HOOK
 #!/bin/sh
+set -e
+LIVE="/etc/letsencrypt/live/$domain"
+if [ -n "\${RENEWED_LINEAGE:-}" ] && [ "\$RENEWED_LINEAGE" != "\$LIVE" ]; then
+    exit 0
+fi
+install -d -m 750 -o root -g $PHANTOM_USER $TLS_DIR
+install -m 640 -o root -g $PHANTOM_USER "\$LIVE/fullchain.pem" $TLS_DIR/cert.pem
+install -m 640 -o root -g $PHANTOM_USER "\$LIVE/privkey.pem" $TLS_DIR/key.pem
 systemctl reload phantom-server-tcp phantom-server-quic 2>/dev/null || true
 HOOK
     chmod 755 /etc/letsencrypt/renewal-hooks/deploy/phantom-reload.sh
+    # Run once now so the copy exists before the service starts.
+    /etc/letsencrypt/renewal-hooks/deploy/phantom-reload.sh
 }
 
 # ============================================================
@@ -416,8 +526,9 @@ RestartSec=5s
 LimitNOFILE=1048576
 
 # --- Sandboxing (unknown keys are ignored by older systemd) ---
-# Runs as root only so it can read root-owned certificates; every root
-# capability except binding to :443 is dropped.
+# Unprivileged user; the only capability is binding to :443.
+User=phantom
+Group=phantom
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
@@ -464,8 +575,9 @@ RestartSec=5s
 LimitNOFILE=1048576
 
 # --- Sandboxing (unknown keys are ignored by older systemd) ---
-# Runs as root only so it can read root-owned certificates; every root
-# capability except binding to :443 is dropped.
+# Unprivileged user; the only capability is binding to :443.
+User=phantom
+Group=phantom
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
@@ -593,7 +705,10 @@ resolve_host_mode() {
     local cert_file
     cert_file=$(grep -oP '"cert_file"\s*:\s*"\K[^"]+' "$CONFIG_DIR/config.json" 2>/dev/null || true)
 
-    if echo "$cert_file" | grep -q '/etc/letsencrypt/live/'; then
+    if [ -s "$DOMAIN_FILE" ]; then
+        HOST=$(head -1 "$DOMAIN_FILE")
+        ALLOW_INSECURE=0
+    elif echo "$cert_file" | grep -q '/etc/letsencrypt/live/'; then
         HOST=$(echo "$cert_file" | sed -E 's|/etc/letsencrypt/live/([^/]+)/.*|\1|')
         ALLOW_INSECURE=0
     else
@@ -649,7 +764,7 @@ cfg.setdefault('server', {})['passwords'] = passwords
 with open(path, 'w') as f:
     json.dump(cfg, f, indent=2)
 PYEOF
-    chmod 600 "$CONFIG_DIR/config.json"
+    fix_permissions
 }
 
 # Tell phantom-server to re-read config.json without dropping live
@@ -852,6 +967,7 @@ uninstall() {
     rm -f "$SERVICE_FILE_TCP" "$SERVICE_FILE_QUIC" "$SERVICE_FILE_LEGACY"
     rm -rf /etc/phantom/
     rm -f /etc/sysctl.d/99-phantom.conf /etc/letsencrypt/renewal-hooks/deploy/phantom-reload.sh
+    userdel "$PHANTOM_USER" 2>/dev/null || true
     systemctl daemon-reload
     info "Phantom has been uninstalled."
     info "Note: Nginx config was modified during install. To fully revert, run:"
@@ -862,23 +978,61 @@ uninstall() {
 # ============================================================
 # Upgrade: new binary + service units, keep config / users / certificates
 # ============================================================
+# Migrates a 1.x configuration in place: certificates copied to $TLS_DIR,
+# fallback_h2_addr and DNS-over-TLS added when absent. Passwords untouched.
+migrate_config() {
+    local le_domain
+    le_domain=$(grep -oP '"cert_file"\s*:\s*"/etc/letsencrypt/live/\K[^/"]+' "$CONFIG_DIR/config.json" 2>/dev/null || true)
+    install -d -m 750 -o root -g "$PHANTOM_USER" "$TLS_DIR"
+    if [ -n "$le_domain" ]; then
+        install_cert_hook "$le_domain"
+        echo "$le_domain" > "$DOMAIN_FILE"
+    fi
+    local h2=""
+    [ "${NGINX_H2:-true}" = true ] && h2="127.0.0.1:8081"
+    python3 - "$CONFIG_DIR/config.json" "$TLS_DIR" "${le_domain:-}" "$h2" <<'PYEOF'
+import json, sys
+path, tls_dir, le_domain, h2 = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open(path) as f:
+    cfg = json.load(f)
+srv = cfg.setdefault("server", {})
+if le_domain:
+    srv["cert_file"] = tls_dir + "/cert.pem"
+    srv["key_file"] = tls_dir + "/key.pem"
+srv["fallback_h2_addr"] = h2
+if not srv.get("dns_over_tls"):
+    srv["dns_over_tls"] = ["9.9.9.9", "149.112.112.112"]
+    srv["dns_tls_name"] = "dns.quad9.net"
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+PYEOF
+}
+
 upgrade() {
     require_installed || return 1
     if [ "$PHANTOM_VERSION" = "unknown" ] || [ -z "$PHANTOM_VERSION" ]; then
         error "Cannot upgrade — version was not resolved. Re-run with a working network connection, or set PHANTOM_VERSION."
     fi
     check_root
+    detect_os
     local current
     current=$("$PHANTOM_DIR/phantom-server" --version 2>/dev/null | awk '{print $2}')
     info "Upgrading phantom-server ${current:-unknown} -> $PHANTOM_VERSION (users, passwords and certificates are kept)"
     cp -p "$CONFIG_DIR/config.json" "$CONFIG_DIR/config.json.bak"
     download_phantom
+    ensure_user
+    USE_DOMAIN=false   # never re-run certbot during an upgrade
+    configure_nginx
+    migrate_config
+    fix_permissions
     configure_sysctl
-    if grep -q '/etc/letsencrypt/' "$CONFIG_DIR/config.json"; then
-        install_cert_hook
-    fi
     install_service
     info "Upgrade complete. Existing links and QR codes keep working."
+    info "phantom-server now runs as the unprivileged '$PHANTOM_USER' user and resolves"
+    info "targets with DNS-over-TLS (Quad9). To use another resolver, edit"
+    info "dns_over_tls / dns_tls_name in $CONFIG_DIR/config.json and run:"
+    info "  systemctl reload phantom-server-tcp phantom-server-quic"
+    warn "QUIC clients must be updated to phantom-client 2.0 (QUIC now runs over HTTP/3)."
 }
 
 # ============================================================
@@ -940,6 +1094,7 @@ main() {
     ask_domain
     install_deps
     download_phantom
+    ensure_user
     configure_nginx
     generate_config
     configure_firewall

@@ -31,6 +31,14 @@ import (
 // BufferSize matches smux's maximum frame payload and two TLS records.
 const BufferSize = 32 * 1024
 
+// smallBufferSize is what every direction starts with. Most proxied
+// connections spend most of their life idle (keep-alive HTTP, push channels,
+// chat apps), and a 32 KiB buffer per direction held for the whole lifetime
+// of each one dominated server memory. A direction is promoted to a full
+// BufferSize buffer the first time a read fills the small one, i.e. as soon
+// as it carries bulk data, so throughput is unaffected.
+const smallBufferSize = 2 * 1024
+
 // DefaultIdleTimeout is how long a relayed connection may be completely silent
 // (no bytes in either direction) before it is torn down.
 const DefaultIdleTimeout = 5 * time.Minute
@@ -38,6 +46,13 @@ const DefaultIdleTimeout = 5 * time.Minute
 var bufPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, BufferSize)
+		return &b
+	},
+}
+
+var smallPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, smallBufferSize)
 		return &b
 	},
 }
@@ -80,9 +95,16 @@ func Pipe(a, b io.ReadWriter, idle time.Duration) (aToB, bToA int64) {
 
 // pump copies src -> dst. On exit it signals the opposite direction.
 func pump(dst io.Writer, src io.Reader, st *pipeState) int64 {
-	bp := GetBuffer()
-	defer PutBuffer(bp)
-	buf := *bp
+	small := smallPool.Get().(*[]byte)
+	var big *[]byte
+	buf := *small
+	defer func() {
+		if big != nil {
+			PutBuffer(big)
+		} else {
+			smallPool.Put(small)
+		}
+	}()
 
 	rd, canReadDL := src.(readDeadliner)
 	wd, canWriteDL := dst.(writeDeadliner)
@@ -120,6 +142,12 @@ func pump(dst io.Writer, src io.Reader, st *pipeState) int64 {
 			total += int64(nw)
 			if err != nil {
 				break
+			}
+			if big == nil && n == len(buf) {
+				// Bulk transfer: switch to the full-size buffer.
+				big = GetBuffer()
+				buf = *big
+				smallPool.Put(small)
 			}
 		}
 		if err != nil {

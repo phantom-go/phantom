@@ -16,8 +16,11 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/phantom-go/phantom/internal/resolver"
 )
 
 // blockedPrefixes are ranges the SSRF guard refuses in addition to the
@@ -83,15 +86,6 @@ func isDisallowedAddr(ip netip.Addr) bool {
 	return false
 }
 
-// isDisallowedTargetIP is the net.IP form of isDisallowedAddr.
-func isDisallowedTargetIP(ip net.IP) bool {
-	a, ok := netip.AddrFromSlice(ip)
-	if !ok {
-		return true
-	}
-	return isDisallowedAddr(a)
-}
-
 var errDisallowedTarget = errors.New("refusing to relay to disallowed address")
 
 // ssrfControl runs after DNS resolution, immediately before connect(2), on
@@ -128,22 +122,138 @@ func targetDialer(allowPrivate bool, timeout time.Duration) *net.Dialer {
 	return d
 }
 
+// targetResolver resolves relay targets. Set at startup (system resolver or
+// DNS-over-TLS); tests may replace it.
+var targetResolver resolver.Resolver = resolver.System{}
+
+// happyEyeballsDelay is how long the preferred address family gets before the
+// other family is tried in parallel (RFC 8305 recommends 250 ms; Go uses 300).
+const happyEyeballsDelay = 300 * time.Millisecond
+
 // safeDialTCP dials target under the SSRF guard. Literal disallowed IPs are
-// rejected before any syscall; for hostnames every candidate address is
-// checked at connect time by ssrfControl.
+// rejected before any syscall; for host names the resolved addresses are
+// filtered, and every connect is re-checked on the exact socket address by
+// ssrfControl, so DNS rebinding cannot slip through.
 func safeDialTCP(target string, allowPrivate bool, timeout time.Duration) (net.Conn, error) {
-	host, _, err := net.SplitHostPort(target)
+	host, portStr, err := net.SplitHostPort(target)
 	if err != nil {
 		return nil, fmt.Errorf("invalid target %q: %w", target, err)
 	}
-	if !allowPrivate {
-		if ip, err := netip.ParseAddr(host); err == nil && isDisallowedAddr(ip) {
-			return nil, fmt.Errorf("%w %s", errDisallowedTarget, ip)
-		}
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return nil, fmt.Errorf("invalid port in %q", target)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	return targetDialer(allowPrivate, timeout).DialContext(ctx, "tcp", target)
+	d := targetDialer(allowPrivate, timeout)
+
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if !allowPrivate && isDisallowedAddr(ip) {
+			return nil, fmt.Errorf("%w %s", errDisallowedTarget, ip)
+		}
+		return d.DialContext(ctx, "tcp", netip.AddrPortFrom(ip.Unmap(), uint16(port)).String())
+	}
+
+	addrs, err := targetResolver.LookupNetIP(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %q: %w", host, err)
+	}
+	if !allowPrivate {
+		allowed := addrs[:0:0]
+		for _, a := range addrs {
+			if !isDisallowedAddr(a) {
+				allowed = append(allowed, a)
+			}
+		}
+		if len(allowed) == 0 {
+			return nil, fmt.Errorf("%w: %q resolves only to disallowed addresses", errDisallowedTarget, host)
+		}
+		addrs = allowed
+	}
+	return dialHappyEyeballs(ctx, d, addrs, uint16(port))
+}
+
+// dialHappyEyeballs races IPv6 and IPv4 (RFC 8305, simplified): IPv6 starts
+// first; IPv4 starts after happyEyeballsDelay or as soon as IPv6 fails. The
+// first successful connection wins and any late one is closed.
+func dialHappyEyeballs(ctx context.Context, d *net.Dialer, addrs []netip.Addr, port uint16) (net.Conn, error) {
+	var v6, v4 []netip.Addr
+	for _, a := range addrs {
+		a = a.Unmap()
+		if a.Is4() {
+			v4 = append(v4, a)
+		} else {
+			v6 = append(v6, a)
+		}
+	}
+	primary, fallback := v6, v4
+	if len(primary) == 0 {
+		primary, fallback = v4, nil
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type result struct {
+		c   net.Conn
+		err error
+	}
+	results := make(chan result, 2)
+	dialSerial := func(list []netip.Addr) {
+		var lastErr error
+		for _, a := range list {
+			c, err := d.DialContext(ctx, "tcp", netip.AddrPortFrom(a, port).String())
+			if err == nil {
+				results <- result{c: c}
+				return
+			}
+			lastErr = err
+			if ctx.Err() != nil {
+				break
+			}
+		}
+		results <- result{err: lastErr}
+	}
+
+	go dialSerial(primary)
+	pending, fallbackStarted := 1, false
+	startFallback := func() {
+		if !fallbackStarted && len(fallback) > 0 {
+			fallbackStarted = true
+			pending++
+			go dialSerial(fallback)
+		}
+	}
+	timer := time.NewTimer(happyEyeballsDelay)
+	defer timer.Stop()
+
+	var firstErr error
+	for {
+		select {
+		case <-timer.C:
+			startFallback()
+		case r := <-results:
+			pending--
+			if r.err == nil {
+				if pending > 0 {
+					go func(n int) { // close the loser(s)
+						for i := 0; i < n; i++ {
+							if lr := <-results; lr.c != nil {
+								lr.c.Close()
+							}
+						}
+					}(pending)
+				}
+				return r.c, nil
+			}
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			startFallback()
+			if pending == 0 {
+				return nil, firstErr
+			}
+		}
+	}
 }
 
 // resolveAllowedIP resolves target once and returns "ip:port" for the first
@@ -155,16 +265,13 @@ func resolveAllowedIP(ctx context.Context, target string, allowPrivate bool) (st
 	if err != nil {
 		return "", fmt.Errorf("invalid target %q: %w", target, err)
 	}
-	if allowPrivate {
-		return target, nil
-	}
 	if ip, err := netip.ParseAddr(host); err == nil {
-		if isDisallowedAddr(ip) {
+		if !allowPrivate && isDisallowedAddr(ip) {
 			return "", fmt.Errorf("%w %s", errDisallowedTarget, ip)
 		}
 		return net.JoinHostPort(ip.Unmap().String(), port), nil
 	}
-	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	ips, err := targetResolver.LookupNetIP(ctx, host)
 	if err != nil {
 		return "", fmt.Errorf("resolve target %q: %w", host, err)
 	}
@@ -173,7 +280,7 @@ func resolveAllowedIP(ctx context.Context, target string, allowPrivate bool) (st
 	}
 	pick := netip.Addr{}
 	for _, ip := range ips {
-		if isDisallowedAddr(ip) {
+		if !allowPrivate && isDisallowedAddr(ip) {
 			return "", fmt.Errorf("refusing to relay to %q (resolves to disallowed address %s)", host, ip)
 		}
 		// Prefer IPv4 for UDP: far more servers have working v4 egress.
@@ -185,14 +292,14 @@ func resolveAllowedIP(ctx context.Context, target string, allowPrivate bool) (st
 }
 
 // safeResolveUDP resolves+verifies target under the SSRF guard and returns the
-// pinned *net.UDPAddr to dial.
-func safeResolveUDP(target string, allowPrivate bool) (*net.UDPAddr, error) {
+// pinned address to send to.
+func safeResolveUDP(target string, allowPrivate bool) (netip.AddrPort, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	ipPort, err := resolveAllowedIP(ctx, target, allowPrivate)
 	if err != nil {
-		return nil, err
+		return netip.AddrPort{}, err
 	}
-	return net.ResolveUDPAddr("udp", ipPort)
+	return netip.ParseAddrPort(ipPort)
 }

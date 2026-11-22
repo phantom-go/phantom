@@ -73,6 +73,21 @@ type sessionPool struct {
 	// fired N simultaneous TLS handshakes (a loud fingerprint, wasted
 	// RTTs) and appended all N sessions — ignoring maxSize entirely.
 	dialDone chan struct{}
+
+	// idleTimeout closes sessions that have carried no streams for this
+	// long (0 = keep sessions forever and re-dial an empty pool, the
+	// pre-2.0 always-on behaviour). idleSince records when each session
+	// was first seen idle.
+	idleTimeout time.Duration
+	idleSince   map[pooledSession]time.Time
+}
+
+// withIdleTimeout enables closing idle sessions; it returns p for chaining.
+func (p *sessionPool) withIdleTimeout(d time.Duration) *sessionPool {
+	p.mu.Lock()
+	p.idleTimeout = d
+	p.mu.Unlock()
+	return p
 }
 
 // newSessionPool builds a pool. maxSize < 1 is clamped to 1. growthThreshold
@@ -258,11 +273,63 @@ func (p *sessionPool) keepAlive(interval time.Duration, stop <-chan struct{}) {
 		case <-t.C:
 			p.mu.Lock()
 			p.pruneLocked()
+			if p.idleTimeout > 0 {
+				p.closeIdleLocked(time.Now())
+				p.mu.Unlock()
+				continue
+			}
+			// Always-on mode: keep one session up even with no traffic.
 			if len(p.sessions) == 0 && !p.dialing {
 				_, _ = p.dialLocked()
 			} else {
 				p.mu.Unlock()
 			}
+		}
+	}
+}
+
+// closeIdleLocked closes sessions that have had no streams for idleTimeout.
+// A closed session is simply re-dialled by the next OpenStream. Caller holds
+// p.mu.
+func (p *sessionPool) closeIdleLocked(now time.Time) {
+	if p.idleSince == nil {
+		p.idleSince = make(map[pooledSession]time.Time)
+	}
+	keep := p.sessions[:0]
+	for _, s := range p.sessions {
+		if s.NumStreams() > 0 {
+			delete(p.idleSince, s)
+			keep = append(keep, s)
+			continue
+		}
+		since, seen := p.idleSince[s]
+		if !seen {
+			p.idleSince[s] = now
+			keep = append(keep, s)
+			continue
+		}
+		if now.Sub(since) >= p.idleTimeout {
+			delete(p.idleSince, s)
+			s.Close()
+			continue
+		}
+		keep = append(keep, s)
+	}
+	p.sessions = keep
+	if p.rr >= len(p.sessions) {
+		p.rr = 0
+	}
+	// Forget sessions that pruneLocked already removed.
+	for s := range p.idleSince {
+		found := false
+		for _, live := range p.sessions {
+			if live == s {
+				found = true
+				break
+			}
+		}
+		if !found {
+			delete(p.idleSince, s)
 		}
 	}
 }

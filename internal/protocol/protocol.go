@@ -238,12 +238,6 @@ func readCRLFScratch(r io.Reader, sp *scratch) error {
 	return nil
 }
 
-func readAddress(r io.Reader) (Address, error) {
-	sp := scratchPool.Get().(*scratch)
-	defer scratchPool.Put(sp)
-	return readAddressScratch(r, sp)
-}
-
 func readAddressScratch(r io.Reader, sp *scratch) (Address, error) {
 	head := sp[:2]
 	if _, err := io.ReadFull(r, head[:1]); err != nil {

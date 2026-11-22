@@ -26,7 +26,7 @@ independent protocol identity.
 ### Session Lifecycle & Multiplexing
 
 - **TCP Mode**: The client multiplexes multiple logical streams over a single underlying TLS connection using smux (MuxSession). This eliminates TCP 3-way handshake overhead for individual connections.
-- **QUIC Mode**: The client leverages native QUIC streams directly over a single QUIC connection, benefiting from built-in 0-RTT handshakes and head-of-line blocking elimination.
+- **QUIC Mode**: QUIC carries standard HTTP/3. Each proxied connection is one HTTP/3 `CONNECT` request stream authenticated with `Proxy-Authorization`, so there is no TCP head-of-line blocking, and to observers and probers the server is an ordinary HTTP/3 website. (0-RTT is deliberately not used: early data is replayable.)
 
 ## Layers
 
@@ -46,7 +46,7 @@ independent protocol identity.
 
 - **RewindConn**: Buffers the initial read operations during parsing. If the request proves to be an unauthorized active probe, the buffer is rewound, and the raw payload is replayed seamlessly to the fallback address.
 - **MuxSession**: smux-based stream multiplexing over a secure TCP connection.
-- **QUICListener / DialQUIC**: Native QUIC transport mapping QUIC streams to proxy sub-connections.
+- **QUICListener / DialQUIC / H3ClientConn**: QUIC with ALPN `h3`; proxy sub-connections are authenticated HTTP/3 CONNECT streams, everything else is served by the fallback website.
 - **SessionPool**: Manages active connections on the client side with automatic connection state checking and seamless reconnection.
 
 ### SOCKS5 Layer (<code>internal/socks5</code>)

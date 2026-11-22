@@ -23,13 +23,8 @@ type harness struct {
 	addr     string
 	echoPort uint16
 	echo6    uint16
-	fbHits   *countingListener
 	tlsCli   *tls.Config
-}
-
-type countingListener struct {
-	mu   sync.Mutex
-	hits int
+	lim      *auth.RateLimiter
 }
 
 func echoServer(t *testing.T, network, addr string, prefix []byte) (net.Listener, uint16) {
@@ -56,26 +51,35 @@ func echoServer(t *testing.T, network, addr string, prefix []byte) (net.Listener
 	return ln, uint16(ln.Addr().(*net.TCPAddr).Port)
 }
 
-func newHarness(t *testing.T) *harness {
+var harnessOnce sync.Once
+
+func newHarness(t *testing.T) *harness { return startServer(t, 1000) }
+
+// startServer runs a TCP server with production ALPN and the given rate
+// limiter threshold. Timeouts are set once for the whole package so no test
+// races with a server goroutine of an earlier test.
+func startServer(t *testing.T, maxFailures int) *harness {
 	t.Helper()
-	log = logger.NewWithLevel("error")
-	allowPrivateTargets = true
-	handshakeTimeout = 300 * time.Millisecond
-	probeIdleTimeout = 500 * time.Millisecond
+	harnessOnce.Do(func() {
+		log = logger.NewWithLevel("error")
+		allowPrivateTargets = true
+		handshakeTimeout = 1 * time.Second
+		probeIdleTimeout = 2 * time.Second
+	})
 
 	cert, err := tls.LoadX509KeyPair("../../server.crt", "../../server.key")
 	if err != nil {
 		t.Skip("server.crt/server.key not present at repo root")
 	}
-	h := &harness{tlsCli: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"phantom"}}}
+	h := &harness{tlsCli: &tls.Config{InsecureSkipVerify: true}}
 
 	_, h.echoPort = echoServer(t, "tcp", "127.0.0.1:0", nil)
 	_, h.echo6 = echoServer(t, "tcp6", "[::1]:0", nil)
 	fbLn, _ := echoServer(t, "tcp", "127.0.0.1:0", []byte("FALLBACK"))
-	fb := fbLn.Addr().String()
-	fallbackAddr.Store(&fb)
+	fbH2, _ := echoServer(t, "tcp", "127.0.0.1:0", []byte("FALLBACK-H2"))
+	setFallbacks(fbLn.Addr().String(), fbH2.Addr().String())
 
-	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"phantom"}})
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h2", "http/1.1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,11 +87,11 @@ func newHarness(t *testing.T) *harness {
 	h.addr = ln.Addr().String()
 
 	a := auth.NewStaticAuth([]string{testPassword})
-	lim := auth.NewRateLimiter(1000, time.Minute, time.Minute)
-	t.Cleanup(lim.Close)
+	h.lim = auth.NewRateLimiter(maxFailures, time.Minute, time.Minute)
+	t.Cleanup(h.lim.Close)
 	m := metrics.New()
 	var wg sync.WaitGroup
-	go acceptLoop(ln, &wg, func(c net.Conn) { handleSession(c, a, lim, m) })
+	go acceptLoop(ln, &wg, func(c net.Conn) { handleSession(c, a, h.lim, m) })
 	return h
 }
 

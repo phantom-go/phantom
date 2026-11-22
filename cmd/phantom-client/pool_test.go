@@ -318,3 +318,49 @@ func TestPoolColdStartDialsOnce(t *testing.T) {
 		t.Errorf("cold start: %d OpenStream failures", f)
 	}
 }
+
+// Idle sessions are closed after idleTimeout and transparently re-dialled.
+func TestPoolClosesIdleSessions(t *testing.T) {
+	dial, dials, _, _ := dialerFactory(0)
+	p := newSessionPool(1, 16, dial).withIdleTimeout(50 * time.Millisecond)
+	defer p.Close()
+	st, err := p.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	p.mu.Lock()
+	p.closeIdleLocked(time.Now()) // first sighting: marks idle
+	p.closeIdleLocked(time.Now().Add(time.Second))
+	n := len(p.sessions)
+	p.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("idle session not closed: %d left", n)
+	}
+	if st, err := p.OpenStream(); err != nil {
+		t.Fatalf("re-dial after idle close: %v", err)
+	} else {
+		st.Close()
+	}
+	if dials.Load() != 2 {
+		t.Fatalf("expected a fresh dial after idle close, got %d dials", dials.Load())
+	}
+}
+
+// A session that is carrying a stream is never closed as idle.
+func TestPoolKeepsBusySessions(t *testing.T) {
+	dial, _, _, _ := dialerFactory(0)
+	p := newSessionPool(1, 16, dial).withIdleTimeout(time.Millisecond)
+	defer p.Close()
+	st, _ := p.OpenStream()
+	defer st.Close()
+	p.mu.Lock()
+	p.closeIdleLocked(time.Now())
+	p.closeIdleLocked(time.Now().Add(time.Hour))
+	n := len(p.sessions)
+	p.mu.Unlock()
+	if n != 1 {
+		t.Fatal("busy session was closed")
+	}
+}

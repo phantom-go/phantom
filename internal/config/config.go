@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // Thin wrappers — kept as package-locals so the validation helpers
@@ -54,6 +55,22 @@ type ServerConfig struct {
 	// metadata endpoint (169.254.169.254). Enable only when the server
 	// is deliberately used to reach a trusted private network.
 	AllowPrivateTargets bool `json:"allow_private_targets"`
+
+	// FallbackH2Addr is where connections that negotiated ALPN "h2" are
+	// sent when they are not Phantom clients (an HTTP/2-speaking web server,
+	// e.g. nginx `listen 127.0.0.1:8081 http2;`). The server advertises
+	// h2 like any modern HTTPS site; without an h2 fallback an h2 prober
+	// would receive an HTTP/1.1 error instead. Empty = use fallback_addr.
+	FallbackH2Addr string `json:"fallback_h2_addr,omitempty"`
+
+	// DNSOverTLS lists DNS-over-TLS resolvers (IP or IP:port, default port
+	// 853) used to resolve relay targets. Empty = the system resolver,
+	// which sends every user's lookups in plaintext to the VPS provider.
+	DNSOverTLS []string `json:"dns_over_tls,omitempty"`
+
+	// DNSTLSName is the certificate name of the DoT resolvers (e.g.
+	// "dns.quad9.net"). Required when dns_over_tls is set.
+	DNSTLSName string `json:"dns_tls_name,omitempty"`
 }
 
 type ClientConfig struct {
@@ -135,6 +152,28 @@ type ClientConfig struct {
 	// all (verify=false skipped every check). With verify=true both the
 	// CA chain and the pin must pass.
 	PinnedCertSHA256 string `json:"pinned_cert_sha256,omitempty"`
+
+	// SessionIdleTimeout (seconds) closes a connection to the server once
+	// it has carried no streams for this long; the next request reconnects.
+	// 0 = default (300). Negative = never close (always-on, the pre-2.0
+	// behaviour, which also re-dials every 15 s when the link drops).
+	//
+	// An always-on session sends a keep-alive every 10 s around the clock:
+	// a recognisable traffic pattern, battery drain on phones, and ~170 KiB
+	// of server memory per idle client.
+	SessionIdleTimeout int `json:"session_idle_timeout,omitempty"`
+}
+
+// IdleTimeout returns the effective session idle timeout; 0 means never.
+func (c *ClientConfig) IdleTimeout() time.Duration {
+	switch {
+	case c.SessionIdleTimeout < 0:
+		return 0
+	case c.SessionIdleTimeout == 0:
+		return 300 * time.Second
+	default:
+		return time.Duration(c.SessionIdleTimeout) * time.Second
+	}
 }
 
 // PinnedCertBytes returns the decoded certificate pin, or nil when unset.
@@ -233,6 +272,9 @@ func (c *Config) Validate() error {
 		}
 		if c.Server.WSPath != "" && !strings.HasPrefix(c.Server.WSPath, "/") {
 			return fmt.Errorf("server.ws_path %q must start with '/'", c.Server.WSPath)
+		}
+		if len(c.Server.DNSOverTLS) > 0 && c.Server.DNSTLSName == "" {
+			return fmt.Errorf("server.dns_tls_name is required when server.dns_over_tls is set")
 		}
 		// Set a stealthy default path if transport is websocket
 		if c.Server.Transport == "ws" && c.Server.WSPath == "" {

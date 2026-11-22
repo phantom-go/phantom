@@ -76,6 +76,13 @@ func main() {
 	if !cfg.Client.VerifyEnabled() && cfg.Client.PinnedCertSHA256 == "" {
 		log.Warn("verify=false without pinned_cert_sha256: the server is NOT authenticated and the tunnel is open to man-in-the-middle attacks")
 	}
+	switch cfg.Client.TLSFingerprint {
+	case "HelloFirefox_Auto", "HelloEdge_Auto":
+		// uTLS's newest Firefox parrot is Firefox 120 (2023) and its Edge
+		// parrot is Edge 85 (2020): both stand out against real current
+		// browsers and neither offers post-quantum key exchange.
+		log.Warn("tls_fingerprint " + cfg.Client.TLSFingerprint + " imitates an outdated browser and has no post-quantum key exchange; HelloChrome_Auto (the default) is recommended")
+	}
 
 	// QUIC is enabled by either the --quic flag or transport="quic" in
 	// config, so a phantom://...?type=quic URI translated into config
@@ -109,7 +116,7 @@ func main() {
 // protocol-spec ?allowInsecure=1 use case for IP + self-signed deployments).
 // When true, the server certificate is verified against the SNI host as
 // usual — operators using a domain + CA cert should leave this enabled.
-func dialUTLS(serverAddr string, fingerprint string, verify bool, pin []byte) (net.Conn, error) {
+func dialUTLS(serverAddr string, fingerprint string, verify bool, pin []byte, alpn []string) (net.Conn, error) {
 	// HelloRandomized occasionally generates a ClientHello that uTLS itself
 	// cannot complete ("CurvePreferences includes unsupported curve"),
 	// which surfaced as random connection failures. A fresh randomisation
@@ -121,7 +128,7 @@ func dialUTLS(serverAddr string, fingerprint string, verify bool, pin []byte) (n
 	var err error
 	for i := 0; i < attempts; i++ {
 		var c net.Conn
-		if c, err = dialUTLSOnce(serverAddr, fingerprint, verify, pin); err == nil {
+		if c, err = dialUTLSOnce(serverAddr, fingerprint, verify, pin, alpn); err == nil {
 			return c, nil
 		}
 		if errors.Is(err, errPinMismatch) {
@@ -131,7 +138,10 @@ func dialUTLS(serverAddr string, fingerprint string, verify bool, pin []byte) (n
 	return nil, err
 }
 
-func dialUTLSOnce(serverAddr string, fingerprint string, verify bool, pin []byte) (net.Conn, error) {
+// dialUTLSOnce performs one browser-fingerprinted TLS handshake. alpn, when
+// non-nil, replaces the parrot's ALPN list (WebSocket mode uses
+// ["http/1.1"], exactly what a browser offers for a WebSocket connection).
+func dialUTLSOnce(serverAddr string, fingerprint string, verify bool, pin []byte, alpn []string) (net.Conn, error) {
 	host, _, err := net.SplitHostPort(serverAddr)
 	if err != nil {
 		host = serverAddr
@@ -146,7 +156,6 @@ func dialUTLSOnce(serverAddr string, fingerprint string, verify bool, pin []byte
 	uConfig := &utls.Config{
 		ServerName:            host,
 		InsecureSkipVerify:    !verify,
-		NextProtos:            []string{"phantom"},
 		VerifyPeerCertificate: pinVerifier(pin),
 	}
 
@@ -163,6 +172,20 @@ func dialUTLSOnce(serverAddr string, fingerprint string, verify bool, pin []byte
 	}
 
 	uConn := utls.UClient(tcpConn, uConfig, clientHelloID)
+	if len(alpn) > 0 {
+		if spec, err := utls.UTLSIdToSpec(clientHelloID); err == nil {
+			for _, ext := range spec.Extensions {
+				if a, ok := ext.(*utls.ALPNExtension); ok {
+					a.AlpnProtocols = alpn
+				}
+			}
+			uConn = utls.UClient(tcpConn, uConfig, utls.HelloCustom)
+			if err := uConn.ApplyPreset(&spec); err != nil {
+				tcpConn.Close()
+				return nil, err
+			}
+		}
+	}
 	// Bound the handshake: an unresponsive server (or a middlebox that
 	// black-holes the ClientHello) previously hung the pool's dial forever.
 	_ = tcpConn.SetDeadline(time.Now().Add(handshakeTimeout))
@@ -224,7 +247,7 @@ func runTCP(cfg *config.Config, ln net.Listener) {
 		cfg.Client.SessionPoolSize,
 		cfg.Client.SessionGrowthThreshold,
 		func() (pooledSession, error) { return dialSmuxSession(cfg) },
-	)
+	).withIdleTimeout(cfg.Client.IdleTimeout())
 	defer pool.Close()
 
 	stop := make(chan struct{})
@@ -233,12 +256,7 @@ func runTCP(cfg *config.Config, ln net.Listener) {
 
 	acceptLoop(ln, func(c net.Conn) {
 		defer c.Close()
-		stream, err := pool.OpenStream()
-		if err != nil {
-			log.Error("open stream", "err", err)
-			return
-		}
-		handleClientConn(c, stream, cfg)
+		handleClientConn(c, pool, cfg)
 	})
 }
 
@@ -286,7 +304,11 @@ func (c *countedSmuxStream) Close() error {
 // handshake. It is invoked by the pool with no lock held.
 func dialSmuxSession(cfg *config.Config) (pooledSession, error) {
 	// 1. Establish the underlying uTLS connection (obfuscates JA3/JA4).
-	conn, err := dialUTLS(cfg.Client.ServerAddr, cfg.Client.TLSFingerprint, cfg.Client.VerifyEnabled(), cfg.Client.PinnedCertBytes())
+	var alpn []string
+	if cfg.Client.Transport == "ws" {
+		alpn = []string{"http/1.1"}
+	}
+	conn, err := dialUTLS(cfg.Client.ServerAddr, cfg.Client.TLSFingerprint, cfg.Client.VerifyEnabled(), cfg.Client.PinnedCertBytes(), alpn)
 	if err != nil {
 		return nil, err
 	}
@@ -318,7 +340,7 @@ func runQUIC(cfg *config.Config, ln net.Listener) {
 		cfg.Client.SessionPoolSize,
 		cfg.Client.SessionGrowthThreshold,
 		func() (pooledSession, error) { return dialQUICSession(cfg) },
-	)
+	).withIdleTimeout(cfg.Client.IdleTimeout())
 	defer pool.Close()
 
 	stop := make(chan struct{})
@@ -327,29 +349,27 @@ func runQUIC(cfg *config.Config, ln net.Listener) {
 
 	acceptLoop(ln, func(c net.Conn) {
 		defer c.Close()
-		stream, err := pool.OpenStream()
-		if err != nil {
-			log.Error("open quic stream", "err", err)
-			return
-		}
-		handleClientConn(c, stream, cfg)
+		handleClientConn(c, pool, cfg)
 	})
 }
 
-// quicSession adapts a *quic.Conn to the pooledSession interface, tracking the
-// number of live streams it has opened so the pool can make growth decisions.
+// quicSession is one HTTP/3 connection to the server; every proxied
+// connection is an authenticated CONNECT stream on it.
 type quicSession struct {
 	conn    *quic.Conn
+	h3      *transport.H3ClientConn
 	streams atomic.Int64
 }
 
 func (s *quicSession) OpenStream() (io.ReadWriteCloser, error) {
-	st, err := s.conn.OpenStream()
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	st, err := s.h3.OpenStream(ctx)
 	if err != nil {
 		return nil, err
 	}
 	s.streams.Add(1)
-	return &countedStream{Stream: st, parent: s}, nil
+	return &countedH3Stream{H3ClientStream: st, parent: s}, nil
 }
 func (s *quicSession) Healthy() bool   { return s.conn != nil && s.conn.Context().Err() == nil }
 func (s *quicSession) NumStreams() int { return int(s.streams.Load()) }
@@ -360,67 +380,51 @@ func (s *quicSession) Close() error {
 	return nil
 }
 
-// countedStream decrements its parent session's stream counter exactly once,
-// on first Close, so NumStreams() reflects live streams.
-type countedStream struct {
-	*quic.Stream
+// countedH3Stream decrements its parent session's stream counter exactly
+// once, on first Close.
+type countedH3Stream struct {
+	*transport.H3ClientStream
 	parent *quicSession
 	once   sync.Once
 }
 
-// Close releases both directions. quic.Stream.Close only closes the send
-// side, so the receive buffer used to linger until the server sent FIN.
-func (c *countedStream) Close() error {
+func (c *countedH3Stream) Close() error {
 	c.once.Do(func() { c.parent.streams.Add(-1) })
-	c.Stream.CancelRead(0)
-	return c.Stream.Close()
+	return c.H3ClientStream.Close()
 }
-
-// CloseWrite half-closes (sends FIN) so the relay can propagate EOF.
-func (c *countedStream) CloseWrite() error { return c.Stream.Close() }
 
 func dialQUICSession(cfg *config.Config) (pooledSession, error) {
-	qc, err := newQUICSession(cfg)
-	if err != nil {
-		return nil, err
-	}
-	return &quicSession{conn: qc}, nil
-}
-
-func newQUICSession(cfg *config.Config) (*quic.Conn, error) {
 	tlsCfg := &tls.Config{
 		// Honour the per-client verify toggle. Same trade-off as dialUTLS:
 		// for IP + self-signed deployments verify must be false; for
 		// domain + CA cert deployments it should stay true.
 		InsecureSkipVerify:    !cfg.Client.VerifyEnabled(),
-		NextProtos:            []string{"phantom"},
-		MinVersion:            tls.VersionTLS13,
 		VerifyPeerCertificate: pinVerifier(cfg.Client.PinnedCertBytes()),
 	}
-	// When verifying, derive ServerName from server_addr so the cert's
-	// SNI / Subject Alt Name is matched against the host the user typed.
-	if cfg.Client.VerifyEnabled() {
-		if host, _, err := net.SplitHostPort(cfg.Client.ServerAddr); err == nil {
-			tlsCfg.ServerName = host
-		} else {
-			tlsCfg.ServerName = cfg.Client.ServerAddr
-		}
+	host, _, err := net.SplitHostPort(cfg.Client.ServerAddr)
+	if err != nil {
+		host = cfg.Client.ServerAddr
+	}
+	// Send SNI for host names like any HTTP/3 client (IPs never carry SNI).
+	if net.ParseIP(host) == nil {
+		tlsCfg.ServerName = host
 	}
 	qc, err := transport.DialQUIC(cfg.Client.ServerAddr, tlsCfg)
 	if err != nil {
 		return nil, err
 	}
-	return qc, nil
+	return &quicSession{conn: qc, h3: transport.NewH3ClientConn(qc, cfg.Client.ServerAddr, passwordHash)}, nil
 }
 
-// handleClientConn services one accepted SOCKS5 connection over a stream that
-// the pool has already opened. It owns the stream's lifecycle. The transport
-// (TCP/smux, WS, QUIC) is irrelevant here — the stream is just a duplex pipe.
-func handleClientConn(conn net.Conn, stream io.ReadWriteCloser, cfg *config.Config) {
-	defer stream.Close()
-
+// handleClientConn services one accepted SOCKS5 connection.
+//
+// The tunnel stream is opened only AFTER the local SOCKS handshake succeeds.
+// v1.x opened it first and closed it unused when the handshake failed; the
+// server counted every such empty stream as a failed login, so 20 local port
+// checks (many apps' proxy health checks) banned the user for 5 minutes.
+func handleClientConn(conn net.Conn, pool *sessionPool, cfg *config.Config) {
 	// A local client that connects and never completes the SOCKS
-	// handshake used to pin a goroutine and a tunnel stream forever.
+	// handshake must not pin a goroutine forever.
 	conn.SetDeadline(time.Now().Add(socksTimeout))
 	req, err := socks5.Handshake(conn)
 	if err != nil {
@@ -428,6 +432,13 @@ func handleClientConn(conn net.Conn, stream io.ReadWriteCloser, cfg *config.Conf
 		return
 	}
 	conn.SetDeadline(time.Time{})
+
+	stream, err := pool.OpenStream()
+	if err != nil {
+		log.Error("open stream", "err", err)
+		return
+	}
+	defer stream.Close()
 
 	cmdHost := req.Host
 	cmdPort := req.Port

@@ -1,8 +1,8 @@
 # Phantom Protocol Specification
 
-**Version**: 0.2
+**Version**: 0.3 (Phantom 2.0)
 **Status**: Draft
-**Last Updated**: 2026-11-04
+**Last Updated**: 2026-11-22
 
 ---
 
@@ -52,10 +52,14 @@ one long-lived session. This is what distinguishes `phantom://` from the
 |:---|:---|:---|
 | `tcp` | TLS over TCP, carrying an smux session | one smux stream |
 | `ws` | TLS → HTTP/1.1 WebSocket upgrade on `path`; binary messages carry the smux byte stream | one smux stream |
-| `quic` | QUIC v1 (TLS 1.3) | one bidirectional QUIC stream |
+| `quic` | QUIC v1 (TLS 1.3) carrying HTTP/3 | one HTTP/3 `CONNECT` request stream |
 
-**TLS.** TLS 1.2+ (QUIC: 1.3). Clients offer ALPN `phantom`. Clients should
-send a mainstream browser ClientHello (uTLS) for `tcp` / `ws`.
+**TLS.** TLS 1.2+ (QUIC: 1.3). No Phantom-specific value may appear in the
+handshake. For `tcp`, clients send a mainstream browser ClientHello (uTLS)
+with that browser's own ALPN list (`h2`, `http/1.1`); for `ws`, the same
+ClientHello with ALPN `http/1.1` only (what browsers offer for WebSockets);
+for `quic`, ALPN `h3`. Servers advertise `h2`, `http/1.1` on TCP and `h3`
+on QUIC. The negotiated ALPN carries no meaning for the Phantom protocol.
 
 **smux (`tcp`, `ws`).** The session uses the
 [smux](https://github.com/xtaci/smux) framing, **protocol version 2**
@@ -65,9 +69,23 @@ identifies a session by the first byte of the TLS stream: `0x02` (smux v2) or
 `0x01` (smux v1, accepted for robustness). Anything else is parsed as a bare
 Request Header (Trojan compatibility).
 
-**QUIC (`quic`).** No smux layer: QUIC already multiplexes. Each
-bidirectional stream carries exactly one proxied connection; unidirectional
-streams are not used and are refused by the server.
+**QUIC (`quic`).** No smux layer: QUIC already multiplexes, and the
+connection is a regular HTTP/3 connection (RFC 9114) — both sides open their
+control streams as usual. Each proxied connection is one HTTP/3 request:
+
+```
+:method               = CONNECT
+:authority            = <server host:port>
+proxy-authorization   = Bearer <56-char lowercase hex SHA-224(password)>
+```
+
+The server answers `200` and the request stream then carries the Phantom
+request header and payload inside HTTP/3 DATA frames, exactly as on an smux
+stream. Clients may send DATA immediately after the request headers, without
+waiting for the response. Any other request — including a `CONNECT` with a
+missing or wrong `proxy-authorization` — is served by the fallback website
+(and a wrong password counts towards the source's ban). `proxy-authorization`
+is a hop-by-hop field and must never be forwarded to the fallback.
 
 **Per stream**, the client first writes the [Request Header](#tcp-request-header),
 then relays payload in both directions. A client may send the header and the
@@ -135,8 +153,16 @@ subsequent raw bytes are replayed transparently to a preconfigured fallback back
 
 A connection that completes TLS but sends nothing is closed after 60 seconds,
 the same as nginx's default `client_header_timeout`. Inside an established
-session, malformed or unauthenticated streams count towards the source IP's
-ban.
+session, streams carrying malformed data or a wrong password count towards the
+source's ban; a stream closed without sending any data does not (clients
+should open a stream only once they have a request to send).
+
+The fallback is chosen by the negotiated ALPN: `h2` connections go to an
+HTTP/2 backend, others to HTTP/1.1, and HTTP/3 requests are reverse-proxied —
+so a prober receives a genuine response in whatever protocol it chose.
+
+Servers limit unauthenticated connections per source (IPv4 address or IPv6
+/64) as well as globally, so one source cannot exhaust the server.
 
 ---
 

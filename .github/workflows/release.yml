@@ -8,6 +8,8 @@ on:
   pull_request:
 
 # Least privilege by default; only the release job may write.
+# Every third-party action is pinned to a full commit SHA (a moved tag cannot
+# inject code into the release pipeline).
 permissions:
   contents: read
 
@@ -16,9 +18,9 @@ jobs:
     name: Vet, test (race) and vulnerability scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           # Always the newest 1.26 patch release, so standard-library
           # security fixes are picked up without editing this file.
@@ -41,7 +43,7 @@ jobs:
 
       - name: govulncheck
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
           govulncheck ./...
 
   build-release:
@@ -51,12 +53,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write      # build-provenance signing (Sigstore, keyless)
+      attestations: write
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           # Always the newest 1.26 patch release, so standard-library
           # security fixes are picked up without editing this file.
@@ -115,8 +119,19 @@ jobs:
           # Checksums verified by docs/install.sh before installing.
           sha256sum phantom-*.tar.gz phantom-*.zip > SHA256SUMS
 
+      # Signed SLSA build provenance: lets anyone verify that a binary was
+      # built by this repository's CI from a specific commit, with
+      #   gh attestation verify phantom-<ver>-linux-amd64.tar.gz -R phantom-go/phantom
+      # (SHA256SUMS alone only proves the download was not corrupted).
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            phantom-*.tar.gz
+            phantom-*.zip
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             phantom-*.tar.gz

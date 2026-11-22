@@ -4,6 +4,97 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [2.0.0] - 2026-11-22
+
+Security, privacy and resource overhaul following a full audit of v1.3.1.
+Every item below was reproduced or measured before it was changed.
+
+### Breaking
+- **QUIC mode now runs over standard HTTP/3.** Each proxied connection is an
+  HTTP/3 `CONNECT` request authenticated with `Proxy-Authorization`; ALPN is
+  `h3`. phantom-client and phantom-server must both be 2.0 for QUIC. TCP and
+  WebSocket modes stay compatible with 1.3.x clients.
+- phantom-server runs as the unprivileged `phantom` user (installer and
+  sample units). Manual installs must make the config and key readable by
+  that user (mode 640, group `phantom`).
+
+### Fixed
+- **Legitimate users could be banned by their own computer.** The client
+  opened a tunnel stream before the local SOCKS handshake and closed it unused
+  when the handshake failed; the server counted every empty stream as a failed
+  login. 20 ordinary local port checks or SOCKS4 attempts cut the user off for
+  5 minutes (reproduced with the release binaries). The client now opens the
+  stream only after a successful handshake, and the server no longer counts
+  streams that carry no data. Wrong passwords still count.
+- **One IP could lock every user out.** 4,096 idle TLS connections from a
+  single address filled the global handshake budget, so the server refused
+  all new connections. Unauthenticated connections are now also limited per
+  source (64 per IPv4 address / IPv6 /64).
+
+### Privacy & anti-probing
+- **No Phantom-specific values on the wire.** The TCP listener advertises
+  `h2, http/1.1` like any HTTPS site (an ALPN `phantom` probe used to
+  confirm the server with certainty); QUIC uses `h3` (the `phantom` ALPN was
+  readable by any on-path observer, since QUIC Initial packets are
+  decryptable); WebSocket mode offers `http/1.1` exactly as a browser does
+  for WebSockets.
+- **Probes get the real website over the protocol they asked for:** HTTP/1.1
+  and HTTP/2 (new `fallback_h2_addr`, served by an nginx HTTP/2 backend) on
+  TCP, and genuine HTTP/3 responses on QUIC. Previously an `h2` probe got a
+  TLS error and a QUIC probe got nothing a web server would send.
+- **DNS-over-TLS for relay targets** (`dns_over_tls`, `dns_tls_name`; the
+  installer defaults to Quad9). Lookups used to go in plaintext to the
+  hosting provider's resolver, which could log every site every user
+  visited. Queries are padded (RFC 8467), answers are cached for their TTL,
+  connections are reused and identical lookups coalesced; if the resolver is
+  unreachable the system resolver is used and a warning is logged.
+- Self-signed certificates name the server's IP instead of `CN=phantom`.
+- nginx no longer reveals its version (`server_tokens off`) and advertises
+  HTTP/3 (`Alt-Svc`), consistent with a site that serves QUIC.
+- The fallback reverse proxy no longer adds `X-Forwarded-For`.
+- Clients close the connection to the server after `session_idle_timeout`
+  (default 300 s) instead of keeping it open forever with a 10-second
+  heartbeat — a 24/7 traffic signature and a drain on phone batteries.
+- Startup warnings for the outdated Firefox 120 / Edge 85 fingerprints, which
+  lack post-quantum key exchange.
+
+### Security
+- **Least privilege:** a capability-restricted root process could still read
+  `/etc/shadow` and SSH host keys (verified). The service now runs as
+  `phantom`; certificates are copied to `/etc/phantom/tls` by a certbot
+  deploy hook that ignores other certificates on the host.
+- **Supply chain:** every GitHub Action is pinned to a commit SHA,
+  govulncheck to a fixed version, and releases carry signed SLSA build
+  provenance (`gh attestation verify <file> -R phantom-go/phantom`).
+
+### Performance & resources
+- Relay buffers start at 2 KiB and grow to 32 KiB only for bulk transfers:
+  server memory per idle proxied connection 87.5 KiB → 27.9 KiB (−68%),
+  throughput unchanged (−0.8%, within noise).
+- UDP associations use one socket for all destinations (was one socket and
+  goroutine per destination, up to 256), with endpoint-independent mapping
+  (games, WebRTC, P2P) and address-and-port filtering (no open inbound port).
+- Happy Eyeballs dialing (IPv6 first, IPv4 after 300 ms or on failure).
+- The QUIC server keeps quic-go's default advertised limits so its transport
+  parameters match other quic-go HTTP/3 servers.
+
+### Installer
+- `[2] Upgrade` migrates 1.x installs: creates the `phantom` user, moves
+  Let's Encrypt certificates to `/etc/phantom/tls`, adds the HTTP/2 fallback
+  and DNS-over-TLS, fixes permissions. Passwords and links are unchanged.
+- nginx gets an HTTP/2 backend on 127.0.0.1:8081 (syntax chosen by nginx
+  version; HTTP/1.1-only fallback if unsupported).
+
+### Dependencies & toolchain
+- Go 1.26.11 (none of its 12 fixes affected Phantom's runtime; build
+  hygiene). Go 1.27.4 was measured and brings no benefit yet (±5 %, +0.6 MB
+  binary); planned before Go 1.26 leaves support.
+- quic-go's own `http3`/`qpack` packages are now compiled in (same upstream
+  project; no new third-party maintainer).
+- smux stays at 1.5.58: the 1.5.62 fixes do not apply to how Phantom uses
+  smux, and that release adds two new dependencies.
+- Removed dead code found by staticcheck.
+
 ## [1.3.1] - 2026-11-04
 
 ### Fixed
