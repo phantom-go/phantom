@@ -26,7 +26,7 @@ independent protocol identity.
 ### Session Lifecycle & Multiplexing
 
 - **TCP Mode**: The client multiplexes multiple logical streams over a single underlying TLS connection using smux (MuxSession). This eliminates TCP 3-way handshake overhead for individual connections.
-- **QUIC Mode**: QUIC carries standard HTTP/3. Each proxied connection is one HTTP/3 `CONNECT` request stream authenticated with `Proxy-Authorization`, so there is no TCP head-of-line blocking, and to observers and probers the server is an ordinary HTTP/3 website. (0-RTT is deliberately not used: early data is replayable.)
+- **QUIC Mode**: QUIC carries standard HTTP/3. Each proxied connection is one HTTP/3 `CONNECT` request stream authenticated with `Proxy-Authorization`, so there is no TCP head-of-line blocking, and to active probers the server is an ordinary HTTP/3 website. (0-RTT is deliberately not used: early data is replayable.)
 
 ## Layers
 

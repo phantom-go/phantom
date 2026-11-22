@@ -44,11 +44,14 @@ Every item below was reproduced or measured before it was changed.
   TLS error and a QUIC probe got nothing a web server would send.
 - **DNS-over-TLS for relay targets** (`dns_over_tls`, `dns_tls_name`; the
   installer defaults to Quad9). Lookups used to go in plaintext to the
-  hosting provider's resolver, which could log every site every user
-  visited. Queries are padded (RFC 8467), answers are cached for their TTL,
+  hosting provider's resolver, which could log every domain every user
+  looked up. (Destination IPs and TLS server names remain visible to the
+  network, as for any proxy.) Queries are padded (RFC 8467), answers are
+  cached for their TTL,
   connections are reused and identical lookups coalesced; if the resolver is
   unreachable the system resolver is used and a warning is logged.
-- Self-signed certificates name the server's IP instead of `CN=phantom`.
+- New self-signed certificates name the server's IP instead of `CN=phantom`
+  (existing ones are kept on upgrade so pinned clients keep working).
 - nginx no longer reveals its version (`server_tokens off`) and advertises
   HTTP/3 (`Alt-Svc`), consistent with a site that serves QUIC.
 - The fallback reverse proxy no longer adds `X-Forwarded-For`.
